@@ -1,16 +1,11 @@
 //! Low-level abstraction for allocating and managing zero-filled pages
 //! of memory.
 
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
-use core::ptr;
-use core::slice;
-#[cfg(not(target_os = "windows"))]
-use libc;
 use more_asserts::assert_le;
 use more_asserts::assert_lt;
-use region;
 use std::io;
+use std::ptr;
+use std::slice;
 
 /// Round `size` up to the nearest multiple of `page_size`.
 fn round_up_to_page_size(size: usize, page_size: usize) -> usize {
@@ -21,7 +16,11 @@ fn round_up_to_page_size(size: usize, page_size: usize) -> usize {
 /// and initially-zeroed memory and a length.
 #[derive(Debug)]
 pub struct Mmap {
-    ptr: *mut u8,
+    // Note that this is stored as a `usize` instead of a `*const` or `*mut`
+    // pointer to allow this structure to be natively `Send` and `Sync` without
+    // `unsafe impl`. This type is sendable across threads and shareable since
+    // the coordination all happens at the OS layer.
+    ptr: usize,
     len: usize,
 }
 
@@ -31,8 +30,9 @@ impl Mmap {
         // Rust's slices require non-null pointers, even when empty. `Vec`
         // contains code to create a non-null dangling pointer value when
         // constructed empty, so we reuse that here.
+        let empty = Vec::<u8>::new();
         Self {
-            ptr: Vec::new().as_mut_ptr(),
+            ptr: empty.as_ptr() as usize,
             len: 0,
         }
     }
@@ -80,7 +80,7 @@ impl Mmap {
             }
 
             Self {
-                ptr: ptr as *mut u8,
+                ptr: ptr as usize,
                 len: mapping_size,
             }
         } else {
@@ -100,7 +100,7 @@ impl Mmap {
             }
 
             let mut result = Self {
-                ptr: ptr as *mut u8,
+                ptr: ptr as usize,
                 len: mapping_size,
             };
 
@@ -144,7 +144,7 @@ impl Mmap {
             }
 
             Self {
-                ptr: ptr as *mut u8,
+                ptr: ptr as usize,
                 len: mapping_size,
             }
         } else {
@@ -156,7 +156,7 @@ impl Mmap {
             }
 
             let mut result = Self {
-                ptr: ptr as *mut u8,
+                ptr: ptr as usize,
                 len: mapping_size,
             };
 
@@ -181,7 +181,8 @@ impl Mmap {
         assert_lt!(start, self.len - len);
 
         // Commit the accessible size.
-        unsafe { region::protect(self.ptr.add(start), len, region::Protection::ReadWrite) }
+        let ptr = self.ptr as *const u8;
+        unsafe { region::protect(ptr.add(start), len, region::Protection::ReadWrite) }
             .map_err(|e| e.to_string())
     }
 
@@ -200,9 +201,10 @@ impl Mmap {
         assert_lt!(start, self.len - len);
 
         // Commit the accessible size.
+        let ptr = self.ptr as *const u8;
         if unsafe {
             VirtualAlloc(
-                self.ptr.add(start) as *mut c_void,
+                ptr.add(start) as *mut c_void,
                 len,
                 MEM_COMMIT,
                 PAGE_READWRITE,
@@ -218,27 +220,32 @@ impl Mmap {
 
     /// Return the allocated memory as a slice of u8.
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.ptr, self.len) }
+        unsafe { slice::from_raw_parts(self.ptr as *const u8, self.len) }
     }
 
     /// Return the allocated memory as a mutable slice of u8.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
+        unsafe { slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
     }
 
     /// Return the allocated memory as a pointer to u8.
     pub fn as_ptr(&self) -> *const u8 {
-        self.ptr
+        self.ptr as *const u8
     }
 
     /// Return the allocated memory as a mutable pointer to u8.
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr
+        self.ptr as *mut u8
     }
 
     /// Return the length of the allocated memory.
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// Return whether any memory has been allocated.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -257,10 +264,15 @@ impl Drop for Mmap {
             use winapi::ctypes::c_void;
             use winapi::um::memoryapi::VirtualFree;
             use winapi::um::winnt::MEM_RELEASE;
-            let r = unsafe { VirtualFree(self.ptr as *mut c_void, self.len, MEM_RELEASE) };
-            assert_eq!(r, 0);
+            let r = unsafe { VirtualFree(self.ptr as *mut c_void, 0, MEM_RELEASE) };
+            assert_ne!(r, 0);
         }
     }
+}
+
+fn _assert() {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    _assert_send_sync::<Mmap>();
 }
 
 #[cfg(test)]

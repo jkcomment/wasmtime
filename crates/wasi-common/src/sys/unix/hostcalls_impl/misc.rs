@@ -3,29 +3,22 @@
 use crate::hostcalls_impl::{ClockEventData, FdEventData};
 use crate::sys::host_impl;
 use crate::{wasi, Error, Result};
-use nix::libc::{self, c_int};
-use std::mem::MaybeUninit;
+use yanix::clock::{clock_getres, clock_gettime, ClockId};
 
-fn wasi_clock_id_to_unix(clock_id: wasi::__wasi_clockid_t) -> Result<libc::clockid_t> {
-    // convert the supported clocks to the libc types, or return EINVAL
+fn wasi_clock_id_to_unix(clock_id: wasi::__wasi_clockid_t) -> Result<ClockId> {
+    // convert the supported clocks to libc types, or return EINVAL
     match clock_id {
-        wasi::__WASI_CLOCK_REALTIME => Ok(libc::CLOCK_REALTIME),
-        wasi::__WASI_CLOCK_MONOTONIC => Ok(libc::CLOCK_MONOTONIC),
-        wasi::__WASI_CLOCK_PROCESS_CPUTIME_ID => Ok(libc::CLOCK_PROCESS_CPUTIME_ID),
-        wasi::__WASI_CLOCK_THREAD_CPUTIME_ID => Ok(libc::CLOCK_THREAD_CPUTIME_ID),
+        wasi::__WASI_CLOCKID_REALTIME => Ok(ClockId::Realtime),
+        wasi::__WASI_CLOCKID_MONOTONIC => Ok(ClockId::Monotonic),
+        wasi::__WASI_CLOCKID_PROCESS_CPUTIME_ID => Ok(ClockId::ProcessCPUTime),
+        wasi::__WASI_CLOCKID_THREAD_CPUTIME_ID => Ok(ClockId::ThreadCPUTime),
         _ => Err(Error::EINVAL),
     }
 }
 
 pub(crate) fn clock_res_get(clock_id: wasi::__wasi_clockid_t) -> Result<wasi::__wasi_timestamp_t> {
     let clock_id = wasi_clock_id_to_unix(clock_id)?;
-    // no `nix` wrapper for clock_getres, so we do it ourselves
-    let mut timespec = MaybeUninit::<libc::timespec>::uninit();
-    let res = unsafe { libc::clock_getres(clock_id, timespec.as_mut_ptr()) };
-    if res != 0 {
-        return Err(host_impl::errno_from_nix(nix::errno::Errno::last()));
-    }
-    let timespec = unsafe { timespec.assume_init() };
+    let timespec = clock_getres(clock_id)?;
 
     // convert to nanoseconds, returning EOVERFLOW in case of overflow;
     // this is freelancing a bit from the spec but seems like it'll
@@ -46,13 +39,7 @@ pub(crate) fn clock_res_get(clock_id: wasi::__wasi_clockid_t) -> Result<wasi::__
 
 pub(crate) fn clock_time_get(clock_id: wasi::__wasi_clockid_t) -> Result<wasi::__wasi_timestamp_t> {
     let clock_id = wasi_clock_id_to_unix(clock_id)?;
-    // no `nix` wrapper for clock_getres, so we do it ourselves
-    let mut timespec = MaybeUninit::<libc::timespec>::uninit();
-    let res = unsafe { libc::clock_gettime(clock_id, timespec.as_mut_ptr()) };
-    if res != 0 {
-        return Err(host_impl::errno_from_nix(nix::errno::Errno::last()));
-    }
-    let timespec = unsafe { timespec.assume_init() };
+    let timespec = clock_gettime(clock_id)?;
 
     // convert to nanoseconds, returning EOVERFLOW in case of overflow; this is freelancing a bit
     // from the spec but seems like it'll be an unusual situation to hit
@@ -67,11 +54,11 @@ pub(crate) fn poll_oneoff(
     fd_events: Vec<FdEventData>,
     events: &mut Vec<wasi::__wasi_event_t>,
 ) -> Result<()> {
-    use nix::{
-        errno::Errno,
-        poll::{poll, PollFd, PollFlags},
-    };
     use std::{convert::TryInto, os::unix::prelude::AsRawFd};
+    use yanix::{
+        poll::{poll, PollFd, PollFlags},
+        Errno,
+    };
 
     if fd_events.is_empty() && timeout.is_none() {
         return Ok(());
@@ -89,13 +76,13 @@ pub(crate) fn poll_oneoff(
                 // events we filtered before. If we get something else here, the code has a serious bug.
                 _ => unreachable!(),
             };
-            PollFd::new(event.descriptor.as_raw_fd(), flags)
+            unsafe { PollFd::new(event.descriptor.as_raw_fd(), flags) }
         })
         .collect();
 
     let poll_timeout = timeout.map_or(-1, |timeout| {
         let delay = timeout.delay / 1_000_000; // poll syscall requires delay to expressed in milliseconds
-        delay.try_into().unwrap_or(c_int::max_value())
+        delay.try_into().unwrap_or(libc::c_int::max_value())
     });
     log::debug!("poll_oneoff poll_timeout = {:?}", poll_timeout);
 
@@ -107,7 +94,7 @@ pub(crate) fn poll_oneoff(
                 }
                 return Err(host_impl::errno_from_nix(Errno::last()));
             }
-            Ok(ready) => break ready as usize,
+            Ok(ready) => break ready,
         }
     };
 
@@ -119,9 +106,6 @@ pub(crate) fn poll_oneoff(
     })
 }
 
-// define the `fionread()` function, equivalent to `ioctl(fd, FIONREAD, *bytes)`
-nix::ioctl_read_bad!(fionread, nix::libc::FIONREAD, c_int);
-
 fn poll_oneoff_handle_timeout_event(
     timeout: ClockEventData,
     events: &mut Vec<wasi::__wasi_event_t>,
@@ -129,8 +113,8 @@ fn poll_oneoff_handle_timeout_event(
     events.push(wasi::__wasi_event_t {
         userdata: timeout.userdata,
         r#type: wasi::__WASI_EVENTTYPE_CLOCK,
-        error: wasi::__WASI_ESUCCESS,
-        u: wasi::__wasi_event_u {
+        error: wasi::__WASI_ERRNO_SUCCESS,
+        u: wasi::__wasi_event_u_t {
             fd_readwrite: wasi::__wasi_event_fd_readwrite_t {
                 nbytes: 0,
                 flags: 0,
@@ -140,11 +124,11 @@ fn poll_oneoff_handle_timeout_event(
 }
 
 fn poll_oneoff_handle_fd_event<'a>(
-    ready_events: impl Iterator<Item = (FdEventData<'a>, nix::poll::PollFd)>,
+    ready_events: impl Iterator<Item = (FdEventData<'a>, yanix::poll::PollFd)>,
     events: &mut Vec<wasi::__wasi_event_t>,
 ) -> Result<()> {
-    use nix::poll::PollFlags;
     use std::{convert::TryInto, os::unix::prelude::AsRawFd};
+    use yanix::{file::fionread, poll::PollFlags};
 
     for (fd_event, poll_fd) in ready_events {
         log::debug!("poll_oneoff_handle_fd_event fd_event = {:?}", fd_event);
@@ -157,20 +141,21 @@ fn poll_oneoff_handle_fd_event<'a>(
 
         log::debug!("poll_oneoff_handle_fd_event revents = {:?}", revents);
 
-        let mut nbytes = 0;
-        if fd_event.r#type == wasi::__WASI_EVENTTYPE_FD_READ {
-            let _ = unsafe { fionread(fd_event.descriptor.as_raw_fd(), &mut nbytes) };
-        }
+        let nbytes = if fd_event.r#type == wasi::__WASI_EVENTTYPE_FD_READ {
+            unsafe { fionread(fd_event.descriptor.as_raw_fd())? }
+        } else {
+            0
+        };
 
         let output_event = if revents.contains(PollFlags::POLLNVAL) {
             wasi::__wasi_event_t {
                 userdata: fd_event.userdata,
                 r#type: fd_event.r#type,
-                error: wasi::__WASI_EBADF,
-                u: wasi::__wasi_event_u {
+                error: wasi::__WASI_ERRNO_BADF,
+                u: wasi::__wasi_event_u_t {
                     fd_readwrite: wasi::__wasi_event_fd_readwrite_t {
                         nbytes: 0,
-                        flags: wasi::__WASI_EVENT_FD_READWRITE_HANGUP,
+                        flags: wasi::__WASI_EVENTRWFLAGS_FD_READWRITE_HANGUP,
                     },
                 },
             }
@@ -178,11 +163,11 @@ fn poll_oneoff_handle_fd_event<'a>(
             wasi::__wasi_event_t {
                 userdata: fd_event.userdata,
                 r#type: fd_event.r#type,
-                error: wasi::__WASI_EIO,
-                u: wasi::__wasi_event_u {
+                error: wasi::__WASI_ERRNO_IO,
+                u: wasi::__wasi_event_u_t {
                     fd_readwrite: wasi::__wasi_event_fd_readwrite_t {
                         nbytes: 0,
-                        flags: wasi::__WASI_EVENT_FD_READWRITE_HANGUP,
+                        flags: wasi::__WASI_EVENTRWFLAGS_FD_READWRITE_HANGUP,
                     },
                 },
             }
@@ -190,11 +175,11 @@ fn poll_oneoff_handle_fd_event<'a>(
             wasi::__wasi_event_t {
                 userdata: fd_event.userdata,
                 r#type: fd_event.r#type,
-                error: wasi::__WASI_ESUCCESS,
-                u: wasi::__wasi_event_u {
+                error: wasi::__WASI_ERRNO_SUCCESS,
+                u: wasi::__wasi_event_u_t {
                     fd_readwrite: wasi::__wasi_event_fd_readwrite_t {
                         nbytes: 0,
-                        flags: wasi::__WASI_EVENT_FD_READWRITE_HANGUP,
+                        flags: wasi::__WASI_EVENTRWFLAGS_FD_READWRITE_HANGUP,
                     },
                 },
             }
@@ -202,8 +187,8 @@ fn poll_oneoff_handle_fd_event<'a>(
             wasi::__wasi_event_t {
                 userdata: fd_event.userdata,
                 r#type: fd_event.r#type,
-                error: wasi::__WASI_ESUCCESS,
-                u: wasi::__wasi_event_u {
+                error: wasi::__WASI_ERRNO_SUCCESS,
+                u: wasi::__wasi_event_u_t {
                     fd_readwrite: wasi::__wasi_event_fd_readwrite_t {
                         nbytes: nbytes.try_into()?,
                         flags: 0,

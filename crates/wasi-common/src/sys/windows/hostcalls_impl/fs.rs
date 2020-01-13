@@ -3,9 +3,9 @@
 use super::fs_helpers::*;
 use crate::ctx::WasiCtx;
 use crate::fdentry::FdEntry;
-use crate::helpers::systemtime_to_timestamp;
-use crate::hostcalls_impl::{fd_filestat_set_times_impl, Dirent, FileType, PathGet};
-use crate::sys::fdentry_impl::{determine_type_rights, OsFile};
+use crate::host::{Dirent, FileType};
+use crate::hostcalls_impl::{fd_filestat_set_times_impl, PathGet};
+use crate::sys::fdentry_impl::{determine_type_rights, OsHandle};
 use crate::sys::host_impl::{self, path_from_host};
 use crate::sys::hostcalls_impl::fs_helpers::PathGetExt;
 use crate::{wasi, Error, Result};
@@ -16,7 +16,7 @@ use std::io::{self, Seek, SeekFrom};
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
 use std::os::windows::prelude::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
-use winx::file::{AccessMode, Flags};
+use winx::file::{AccessMode, CreationDisposition, FileModeInformation, Flags};
 
 fn read_at(mut file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     // get current cursor position
@@ -53,14 +53,51 @@ pub(crate) fn fd_pwrite(file: &File, buf: &[u8], offset: wasi::__wasi_filesize_t
 }
 
 pub(crate) fn fd_fdstat_get(fd: &File) -> Result<wasi::__wasi_fdflags_t> {
-    use winx::file::AccessMode;
-    unsafe { winx::file::get_file_access_mode(fd.as_raw_handle()) }
-        .map(host_impl::fdflags_from_win)
-        .map_err(Into::into)
+    let mut fdflags = 0;
+
+    let handle = unsafe { fd.as_raw_handle() };
+
+    let access_mode = winx::file::query_access_information(handle)?;
+    let mode = winx::file::query_mode_information(handle)?;
+
+    // Append without write implies append-only (__WASI_FDFLAGS_APPEND)
+    if access_mode.contains(AccessMode::FILE_APPEND_DATA)
+        && !access_mode.contains(AccessMode::FILE_WRITE_DATA)
+    {
+        fdflags |= wasi::__WASI_FDFLAGS_APPEND;
+    }
+
+    if mode.contains(FileModeInformation::FILE_WRITE_THROUGH) {
+        // Only report __WASI_FDFLAGS_SYNC
+        // This is technically the only one of the O_?SYNC flags Windows supports.
+        fdflags |= wasi::__WASI_FDFLAGS_SYNC;
+    }
+
+    // Files do not support the `__WASI_FDFLAGS_NONBLOCK` flag
+
+    Ok(fdflags)
 }
 
-pub(crate) fn fd_fdstat_set_flags(fd: &File, fdflags: wasi::__wasi_fdflags_t) -> Result<()> {
-    unimplemented!("fd_fdstat_set_flags")
+pub(crate) fn fd_fdstat_set_flags(
+    fd: &File,
+    fdflags: wasi::__wasi_fdflags_t,
+) -> Result<Option<OsHandle>> {
+    let handle = unsafe { fd.as_raw_handle() };
+
+    let access_mode = winx::file::query_access_information(handle)?;
+
+    let new_access_mode = file_access_mode_from_fdflags(
+        fdflags,
+        access_mode.contains(AccessMode::FILE_READ_DATA),
+        access_mode.contains(AccessMode::FILE_WRITE_DATA)
+            | access_mode.contains(AccessMode::FILE_APPEND_DATA),
+    );
+
+    unsafe {
+        Ok(Some(OsHandle::from(File::from_raw_handle(
+            winx::file::reopen_file(handle, new_access_mode, file_flags_from_fdflags(fdflags))?,
+        ))))
+    }
 }
 
 pub(crate) fn fd_advise(
@@ -100,35 +137,33 @@ pub(crate) fn path_open(
 ) -> Result<File> {
     use winx::file::{AccessMode, CreationDisposition, Flags};
 
-    let mut access_mode = AccessMode::READ_CONTROL;
-    if read {
-        access_mode.insert(AccessMode::FILE_GENERIC_READ);
-    }
-    if write {
-        access_mode.insert(AccessMode::FILE_GENERIC_WRITE);
-    }
+    let is_trunc = oflags & wasi::__WASI_OFLAGS_TRUNC != 0;
 
-    let mut flags = Flags::FILE_FLAG_BACKUP_SEMANTICS;
+    if is_trunc {
+        // Windows does not support append mode when opening for truncation
+        // This is because truncation requires `GENERIC_WRITE` access, which will override the removal
+        // of the `FILE_WRITE_DATA` permission.
+        if fdflags & wasi::__WASI_FDFLAGS_APPEND != 0 {
+            return Err(Error::ENOTSUP);
+        }
+    }
 
     // convert open flags
+    // note: the calls to `write(true)` are to bypass an internal OpenOption check
+    // the write flag will ultimately be ignored when `access_mode` is calculated below.
     let mut opts = OpenOptions::new();
-    match host_impl::win_from_oflags(oflags) {
+    match creation_disposition_from_oflags(oflags) {
         CreationDisposition::CREATE_ALWAYS => {
-            opts.create(true).append(true);
+            opts.create(true).write(true);
         }
         CreationDisposition::CREATE_NEW => {
             opts.create_new(true).write(true);
         }
         CreationDisposition::TRUNCATE_EXISTING => {
-            opts.truncate(true);
+            opts.truncate(true).write(true);
         }
         _ => {}
     }
-
-    // convert file descriptor flags
-    let (add_access_mode, add_flags) = host_impl::win_from_fdflags(fdflags);
-    access_mode.insert(add_access_mode);
-    flags.insert(add_flags);
 
     let path = resolved.concatenate()?;
 
@@ -139,7 +174,7 @@ pub(crate) fn path_open(
                 return Err(Error::ELOOP);
             }
             // check if we are trying to open a file as a dir
-            if file_type.is_file() && oflags & wasi::__WASI_O_DIRECTORY != 0 {
+            if file_type.is_file() && oflags & wasi::__WASI_OFLAGS_DIRECTORY != 0 {
                 return Err(Error::ENOTDIR);
             }
         }
@@ -162,10 +197,79 @@ pub(crate) fn path_open(
         },
     }
 
+    let mut access_mode = file_access_mode_from_fdflags(fdflags, read, write);
+
+    // Truncation requires the special `GENERIC_WRITE` bit set (this is why it doesn't work with append-only mode)
+    if is_trunc {
+        access_mode |= AccessMode::GENERIC_WRITE;
+    }
+
     opts.access_mode(access_mode.bits())
-        .custom_flags(flags.bits())
+        .custom_flags(file_flags_from_fdflags(fdflags).bits())
         .open(&path)
         .map_err(Into::into)
+}
+
+fn creation_disposition_from_oflags(oflags: wasi::__wasi_oflags_t) -> CreationDisposition {
+    if oflags & wasi::__WASI_OFLAGS_CREAT != 0 {
+        if oflags & wasi::__WASI_OFLAGS_EXCL != 0 {
+            CreationDisposition::CREATE_NEW
+        } else {
+            CreationDisposition::CREATE_ALWAYS
+        }
+    } else if oflags & wasi::__WASI_OFLAGS_TRUNC != 0 {
+        CreationDisposition::TRUNCATE_EXISTING
+    } else {
+        CreationDisposition::OPEN_EXISTING
+    }
+}
+
+fn file_access_mode_from_fdflags(
+    fdflags: wasi::__wasi_fdflags_t,
+    read: bool,
+    write: bool,
+) -> AccessMode {
+    let mut access_mode = AccessMode::READ_CONTROL;
+
+    // Note that `GENERIC_READ` and `GENERIC_WRITE` cannot be used to properly support append-only mode
+    // The file-specific flags `FILE_GENERIC_READ` and `FILE_GENERIC_WRITE` are used here instead
+    // These flags have the same semantic meaning for file objects, but allow removal of specific permissions (see below)
+    if read {
+        access_mode.insert(AccessMode::FILE_GENERIC_READ);
+    }
+
+    if write {
+        access_mode.insert(AccessMode::FILE_GENERIC_WRITE);
+    }
+
+    // For append, grant the handle FILE_APPEND_DATA access but *not* FILE_WRITE_DATA.
+    // This makes the handle "append only".
+    // Changes to the file pointer will be ignored (like POSIX's O_APPEND behavior).
+    if fdflags & wasi::__WASI_FDFLAGS_APPEND != 0 {
+        access_mode.insert(AccessMode::FILE_APPEND_DATA);
+        access_mode.remove(AccessMode::FILE_WRITE_DATA);
+    }
+
+    access_mode
+}
+
+fn file_flags_from_fdflags(fdflags: wasi::__wasi_fdflags_t) -> Flags {
+    // Enable backup semantics so directories can be opened as files
+    let mut flags = Flags::FILE_FLAG_BACKUP_SEMANTICS;
+
+    // Note: __WASI_FDFLAGS_NONBLOCK is purposely being ignored for files
+    // While Windows does inherently support a non-blocking mode on files, the WASI API will
+    // treat I/O operations on files as synchronous. WASI might have an async-io API in the future.
+
+    // Technically, Windows only supports __WASI_FDFLAGS_SYNC, but treat all the flags as the same.
+    if fdflags & wasi::__WASI_FDFLAGS_DSYNC != 0
+        || fdflags & wasi::__WASI_FDFLAGS_RSYNC != 0
+        || fdflags & wasi::__WASI_FDFLAGS_SYNC != 0
+    {
+        flags.insert(Flags::FILE_FLAG_WRITE_THROUGH);
+    }
+
+    flags
 }
 
 fn dirent_from_path<P: AsRef<Path>>(
@@ -183,10 +287,10 @@ fn dirent_from_path<P: AsRef<Path>>(
         .open(path)?;
     let ty = file.metadata()?.file_type();
     Ok(Dirent {
-        ftype: filetype_from_std(&ty),
+        ftype: host_impl::filetype_from_std(&ty),
         name: name.to_owned(),
         cookie,
-        ino: file_serial_no(&file)?,
+        ino: host_impl::file_serial_no(&file)?,
     })
 }
 
@@ -218,7 +322,7 @@ fn dirent_from_path<P: AsRef<Path>>(
 // .        gets cookie = 1
 // ..       gets cookie = 2
 // other entries, in order they were returned by FindNextFileW get subsequent integers as their cookies
-pub(crate) fn fd_readdir_impl(
+pub(crate) fn fd_readdir(
     fd: &File,
     cookie: wasi::__wasi_dircookie_t,
 ) -> Result<impl Iterator<Item = Result<Dirent>>> {
@@ -239,8 +343,8 @@ pub(crate) fn fd_readdir_impl(
 
         Ok(Dirent {
             name: path_from_host(dir.file_name())?,
-            ftype: filetype_from_std(&dir.file_type()?),
-            ino: File::open(dir.path()).and_then(|f| file_serial_no(&f))?,
+            ftype: host_impl::filetype_from_std(&dir.file_type()?),
+            ino: File::open(dir.path()).and_then(|f| host_impl::file_serial_no(&f))?,
             cookie: no,
         })
     });
@@ -255,30 +359,6 @@ pub(crate) fn fd_readdir_impl(
     //
     // See https://github.com/WebAssembly/WASI/issues/61 for more details.
     Ok(iter.skip(cookie))
-}
-
-// This should actually be common code with Linux
-pub(crate) fn fd_readdir(
-    os_file: &mut OsFile,
-    mut host_buf: &mut [u8],
-    cookie: wasi::__wasi_dircookie_t,
-) -> Result<usize> {
-    let iter = fd_readdir_impl(os_file, cookie)?;
-    let mut used = 0;
-    for dirent in iter {
-        let dirent_raw = dirent?.to_wasi_raw()?;
-        let offset = dirent_raw.len();
-        if host_buf.len() < offset {
-            break;
-        } else {
-            host_buf[0..offset].copy_from_slice(&dirent_raw);
-            used += offset;
-            host_buf = &mut host_buf[offset..];
-        }
-    }
-
-    trace!("     | *buf_used={:?}", used);
-    Ok(used)
 }
 
 pub(crate) fn path_readlink(resolved: PathGet, buf: &mut [u8]) -> Result<usize> {
@@ -387,50 +467,8 @@ pub(crate) fn path_rename(resolved_old: PathGet, resolved_new: PathGet) -> Resul
     })
 }
 
-pub(crate) fn num_hardlinks(file: &File, _metadata: &Metadata) -> io::Result<u64> {
-    Ok(winx::file::get_fileinfo(file)?.nNumberOfLinks.into())
-}
-
-pub(crate) fn device_id(file: &File, _metadata: &Metadata) -> io::Result<u64> {
-    Ok(winx::file::get_fileinfo(file)?.dwVolumeSerialNumber.into())
-}
-
-pub(crate) fn file_serial_no(file: &File) -> io::Result<u64> {
-    let info = winx::file::get_fileinfo(file)?;
-    let high = info.nFileIndexHigh;
-    let low = info.nFileIndexLow;
-    let no = ((high as u64) << 32) | (low as u64);
-    Ok(no)
-}
-
-pub(crate) fn change_time(file: &File, _metadata: &Metadata) -> io::Result<i64> {
-    winx::file::change_time(file)
-}
-
-pub(crate) fn fd_filestat_get_impl(file: &std::fs::File) -> Result<wasi::__wasi_filestat_t> {
-    let metadata = file.metadata()?;
-    Ok(wasi::__wasi_filestat_t {
-        st_dev: device_id(file, &metadata)?,
-        st_ino: file_serial_no(file)?,
-        st_nlink: num_hardlinks(file, &metadata)?.try_into()?, // u64 doesn't fit into u32
-        st_size: metadata.len(),
-        st_atim: systemtime_to_timestamp(metadata.accessed()?)?,
-        st_ctim: change_time(file, &metadata)?.try_into()?, // i64 doesn't fit into u64
-        st_mtim: systemtime_to_timestamp(metadata.modified()?)?,
-        st_filetype: filetype_from_std(&metadata.file_type()).to_wasi(),
-    })
-}
-
-pub(crate) fn filetype_from_std(ftype: &std::fs::FileType) -> FileType {
-    if ftype.is_file() {
-        FileType::RegularFile
-    } else if ftype.is_dir() {
-        FileType::Directory
-    } else if ftype.is_symlink() {
-        FileType::Symlink
-    } else {
-        FileType::Unknown
-    }
+pub(crate) fn fd_filestat_get(file: &std::fs::File) -> Result<wasi::__wasi_filestat_t> {
+    host_impl::filestat_from_win(file)
 }
 
 pub(crate) fn path_filestat_get(
@@ -439,7 +477,7 @@ pub(crate) fn path_filestat_get(
 ) -> Result<wasi::__wasi_filestat_t> {
     let path = resolved.concatenate()?;
     let file = File::open(path)?;
-    fd_filestat_get_impl(&file)
+    host_impl::filestat_from_win(&file)
 }
 
 pub(crate) fn path_filestat_set_times(

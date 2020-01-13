@@ -1,16 +1,14 @@
 use crate::action::{get, inspect_memory, invoke};
-use crate::HashMap;
 use crate::{
     instantiate, ActionError, ActionOutcome, CompilationStrategy, CompiledModule, Compiler,
     InstanceHandle, Namespace, RuntimeValue, SetupError,
 };
-use alloc::boxed::Box;
-use alloc::rc::Rc;
-use alloc::string::{String, ToString};
-use core::cell::RefCell;
-use cranelift_codegen::isa::TargetIsa;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use thiserror::Error;
 use wasmparser::{validate, OperatorValidatorConfig, ValidatingParserConfig};
+use wasmtime_environ::isa::TargetIsa;
 
 /// Indicates an unknown instance was specified.
 #[derive(Error, Debug)]
@@ -119,6 +117,7 @@ impl Context {
         instantiate(
             &mut *self.compiler,
             &data,
+            None,
             &mut self.namespace,
             Rc::clone(&self.global_exports),
             debug_info,
@@ -156,6 +155,7 @@ impl Context {
         CompiledModule::new(
             &mut *self.compiler,
             data,
+            None,
             &mut self.namespace,
             Rc::clone(&self.global_exports),
             debug_info,
@@ -246,6 +246,6 @@ impl Context {
     pub fn get_global_exports(
         &mut self,
     ) -> Rc<RefCell<HashMap<String, Option<wasmtime_runtime::Export>>>> {
-        Rc::clone(&mut self.global_exports)
+        Rc::clone(&self.global_exports)
     }
 }

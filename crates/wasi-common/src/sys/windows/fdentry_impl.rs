@@ -1,26 +1,27 @@
-use crate::fdentry::Descriptor;
+use crate::fdentry::{Descriptor, OsHandleRef};
 use crate::{wasi, Error, Result};
 use std::fs::File;
 use std::io;
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::os::windows::prelude::{AsRawHandle, FromRawHandle, RawHandle};
 
 #[derive(Debug)]
-pub(crate) struct OsFile(File);
+pub(crate) struct OsHandle(File);
 
-impl From<File> for OsFile {
+impl From<File> for OsHandle {
     fn from(file: File) -> Self {
         Self(file)
     }
 }
 
-impl AsRawHandle for OsFile {
+impl AsRawHandle for OsHandle {
     fn as_raw_handle(&self) -> RawHandle {
         self.0.as_raw_handle()
     }
 }
 
-impl Deref for OsFile {
+impl Deref for OsHandle {
     type Target = File;
 
     fn deref(&self) -> &Self::Target {
@@ -28,7 +29,7 @@ impl Deref for OsFile {
     }
 }
 
-impl DerefMut for OsFile {
+impl DerefMut for OsHandle {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
@@ -37,12 +38,20 @@ impl DerefMut for OsFile {
 impl AsRawHandle for Descriptor {
     fn as_raw_handle(&self) -> RawHandle {
         match self {
-            Self::OsFile(file) => file.as_raw_handle(),
+            Self::OsHandle(file) => file.as_raw_handle(),
             Self::Stdin => io::stdin().as_raw_handle(),
             Self::Stdout => io::stdout().as_raw_handle(),
             Self::Stderr => io::stderr().as_raw_handle(),
         }
     }
+}
+
+pub(crate) fn descriptor_as_oshandle<'lifetime>(
+    desc: &'lifetime Descriptor,
+) -> OsHandleRef<'lifetime> {
+    OsHandleRef::new(ManuallyDrop::new(OsHandle::from(unsafe {
+        File::from_raw_handle(desc.as_raw_handle())
+    })))
 }
 
 /// This function is unsafe because it operates on a raw file handle.
@@ -53,18 +62,18 @@ pub(crate) unsafe fn determine_type_and_access_rights<Handle: AsRawHandle>(
     wasi::__wasi_rights_t,
     wasi::__wasi_rights_t,
 )> {
-    use winx::file::{get_file_access_mode, AccessMode};
+    use winx::file::{query_access_information, AccessMode};
 
     let (file_type, mut rights_base, rights_inheriting) = determine_type_rights(handle)?;
 
     match file_type {
         wasi::__WASI_FILETYPE_DIRECTORY | wasi::__WASI_FILETYPE_REGULAR_FILE => {
-            let mode = get_file_access_mode(handle.as_raw_handle())?;
+            let mode = query_access_information(handle.as_raw_handle())?;
             if mode.contains(AccessMode::FILE_GENERIC_READ) {
-                rights_base |= wasi::__WASI_RIGHT_FD_READ;
+                rights_base |= wasi::__WASI_RIGHTS_FD_READ;
             }
             if mode.contains(AccessMode::FILE_GENERIC_WRITE) {
-                rights_base |= wasi::__WASI_RIGHT_FD_WRITE;
+                rights_base |= wasi::__WASI_RIGHTS_FD_WRITE;
             }
         }
         _ => {

@@ -2,10 +2,6 @@
 
 use crate::module_environ::FunctionBodyData;
 use crate::tunables::Tunables;
-use alloc::boxed::Box;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::hash::{Hash, Hasher};
 use cranelift_codegen::ir;
 use cranelift_entity::{EntityRef, PrimaryMap};
 use cranelift_wasm::{
@@ -14,6 +10,7 @@ use cranelift_wasm::{
 };
 use indexmap::IndexMap;
 use more_asserts::assert_ge;
+use std::hash::{Hash, Hasher};
 
 /// A WebAssembly table initializer.
 #[derive(Clone, Debug, Hash)]
@@ -139,17 +136,18 @@ pub struct Module {
     /// Unprocessed signatures exactly as provided by `declare_signature()`.
     pub signatures: PrimaryMap<SignatureIndex, ir::Signature>,
 
-    /// Names of imported functions.
-    pub imported_funcs: PrimaryMap<FuncIndex, (String, String)>,
+    /// Names of imported functions, as well as the index of the import that
+    /// performed this import.
+    pub imported_funcs: PrimaryMap<FuncIndex, (String, String, u32)>,
 
     /// Names of imported tables.
-    pub imported_tables: PrimaryMap<TableIndex, (String, String)>,
+    pub imported_tables: PrimaryMap<TableIndex, (String, String, u32)>,
 
     /// Names of imported memories.
-    pub imported_memories: PrimaryMap<MemoryIndex, (String, String)>,
+    pub imported_memories: PrimaryMap<MemoryIndex, (String, String, u32)>,
 
     /// Names of imported globals.
-    pub imported_globals: PrimaryMap<GlobalIndex, (String, String)>,
+    pub imported_globals: PrimaryMap<GlobalIndex, (String, String, u32)>,
 
     /// Types of functions, imported and local.
     pub functions: PrimaryMap<FuncIndex, SignatureIndex>,
@@ -171,6 +169,9 @@ pub struct Module {
 
     /// WebAssembly table initializers.
     pub table_elements: Vec<TableElements>,
+
+    /// Module name.
+    pub name: Option<String>,
 }
 
 impl Module {
@@ -189,6 +190,7 @@ impl Module {
             exports: IndexMap::new(),
             start_func: None,
             table_elements: Vec::new(),
+            name: None,
         }
     }
 

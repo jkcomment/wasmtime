@@ -1,5 +1,6 @@
 //! Support for compiling with Lightbeam.
 
+use crate::cache::ModuleCacheDataTupleType;
 use crate::compilation::{Compilation, CompileError, Relocations, Traps};
 use crate::func_environ::FuncEnvironment;
 use crate::module::Module;
@@ -10,7 +11,6 @@ use crate::cranelift::RelocSink;
 use cranelift_codegen::{ir, isa};
 use cranelift_entity::{PrimaryMap, SecondaryMap};
 use cranelift_wasm::{DefinedFuncIndex, ModuleTranslationState};
-use lightbeam;
 
 /// A compiler that compiles a WebAssembly module with Lightbeam, directly translating the Wasm file.
 pub struct Lightbeam;
@@ -25,17 +25,7 @@ impl crate::compilation::Compiler for Lightbeam {
         isa: &dyn isa::TargetIsa,
         // TODO
         generate_debug_info: bool,
-    ) -> Result<
-        (
-            Compilation,
-            Relocations,
-            ModuleAddressMap,
-            ValueLabelsRanges,
-            PrimaryMap<DefinedFuncIndex, ir::StackSlots>,
-            Traps,
-        ),
-        CompileError,
-    > {
+    ) -> Result<ModuleCacheDataTupleType, CompileError> {
         if generate_debug_info {
             return Err(CompileError::DebugInfoNotSupported);
         }
@@ -53,15 +43,15 @@ impl crate::compilation::Compiler for Lightbeam {
                 &mut codegen_session,
                 &mut reloc_sink,
                 i.as_u32(),
-                &lightbeam::wasmparser::FunctionBody::new(0, function_body.data),
+                &wasmparser::FunctionBody::new(0, function_body.data),
             )
-            .expect("Failed to translate function. TODO: Stop this from panicking");
+            .map_err(|e| CompileError::Codegen(format!("Failed to translate function: {}", e)))?;
             relocations.push(reloc_sink.func_relocs);
         }
 
         let code_section = codegen_session
             .into_translated_code_section()
-            .expect("Failed to generate output code. TODO: Stop this from panicking");
+            .map_err(|e| CompileError::Codegen(format!("Failed to generate output code: {}", e)))?;
 
         // TODO pass jump table offsets to Compilation::from_buffer() when they
         // are implemented in lightbeam -- using empty set of offsets for now.

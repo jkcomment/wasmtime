@@ -3,21 +3,17 @@
 //! `CompiledModule` to allow compiling and instantiating to be done as separate
 //! steps.
 
-use super::HashMap;
 use crate::compiler::Compiler;
 use crate::link::link_module;
 use crate::resolver::Resolver;
-use alloc::boxed::Box;
-use alloc::rc::Rc;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::cell::RefCell;
-use cranelift_entity::{BoxedSlice, PrimaryMap};
-use cranelift_wasm::{DefinedFuncIndex, SignatureIndex};
-#[cfg(feature = "std")]
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Write;
+use std::rc::Rc;
 use thiserror::Error;
 use wasmtime_debug::read_debuginfo;
+use wasmtime_environ::entity::{BoxedSlice, PrimaryMap};
+use wasmtime_environ::wasm::{DefinedFuncIndex, SignatureIndex};
 use wasmtime_environ::{
     CompileError, DataInitializer, DataInitializerLocation, Module, ModuleEnvironment,
 };
@@ -44,8 +40,8 @@ pub enum SetupError {
     Instantiate(#[from] InstantiationError),
 
     /// Debug information generation error occured.
-    #[error("Debug information error: {0}")]
-    DebugInfo(failure::Error),
+    #[error("Debug information error")]
+    DebugInfo(#[from] anyhow::Error),
 }
 
 /// This is similar to `CompiledModule`, but references the data initializers
@@ -64,12 +60,13 @@ impl<'data> RawCompiledModule<'data> {
     fn new(
         compiler: &mut Compiler,
         data: &'data [u8],
+        module_name: Option<&str>,
         resolver: &mut dyn Resolver,
         debug_info: bool,
     ) -> Result<Self, SetupError> {
         let environ = ModuleEnvironment::new(compiler.frontend_config(), compiler.tunables());
 
-        let translation = environ
+        let mut translation = environ
             .translate(data)
             .map_err(|error| SetupError::Compile(CompileError::Wasm(error)))?;
 
@@ -78,6 +75,8 @@ impl<'data> RawCompiledModule<'data> {
         } else {
             None
         };
+
+        translation.module.name = module_name.map(|s| s.to_string());
 
         let (allocated_functions, jt_offsets, relocations, dbg_image) = compiler.compile(
             &translation.module,
@@ -120,7 +119,6 @@ impl<'data> RawCompiledModule<'data> {
         // Make all code compiled thus far executable.
         compiler.publish_compiled_code();
 
-        #[cfg(feature = "std")]
         let dbg_jit_registration = if let Some(img) = dbg_image {
             let mut bytes = Vec::new();
             bytes.write_all(&img).expect("all written");
@@ -157,11 +155,13 @@ impl CompiledModule {
     pub fn new<'data>(
         compiler: &mut Compiler,
         data: &'data [u8],
+        module_name: Option<&str>,
         resolver: &mut dyn Resolver,
         global_exports: Rc<RefCell<HashMap<String, Option<Export>>>>,
         debug_info: bool,
     ) -> Result<Self, SetupError> {
-        let raw = RawCompiledModule::<'data>::new(compiler, data, resolver, debug_info)?;
+        let raw =
+            RawCompiledModule::<'data>::new(compiler, data, module_name, resolver, debug_info)?;
 
         Ok(Self::from_parts(
             raw.module,
@@ -195,7 +195,7 @@ impl CompiledModule {
             imports,
             data_initializers,
             signatures,
-            dbg_jit_registration: dbg_jit_registration.map(|r| Rc::new(r)),
+            dbg_jit_registration: dbg_jit_registration.map(Rc::new),
         }
     }
 
@@ -259,14 +259,16 @@ impl OwnedDataInitializer {
 ///
 /// This is equivalent to createing a `CompiledModule` and calling `instantiate()` on it,
 /// but avoids creating an intermediate copy of the data initializers.
+#[allow(clippy::implicit_hasher)]
 pub fn instantiate(
     compiler: &mut Compiler,
     data: &[u8],
+    module_name: Option<&str>,
     resolver: &mut dyn Resolver,
     global_exports: Rc<RefCell<HashMap<String, Option<Export>>>>,
     debug_info: bool,
 ) -> Result<InstanceHandle, SetupError> {
-    let raw = RawCompiledModule::new(compiler, data, resolver, debug_info)?;
+    let raw = RawCompiledModule::new(compiler, data, module_name, resolver, debug_info)?;
 
     InstanceHandle::new(
         Rc::new(raw.module),
@@ -275,7 +277,7 @@ pub fn instantiate(
         raw.imports,
         &*raw.data_initializers,
         raw.signatures,
-        raw.dbg_jit_registration.map(|r| Rc::new(r)),
+        raw.dbg_jit_registration.map(Rc::new),
         Box::new(()),
     )
     .map_err(SetupError::Instantiate)

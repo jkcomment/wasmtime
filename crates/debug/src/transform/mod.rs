@@ -1,14 +1,15 @@
 use crate::gc::build_dependencies;
-use crate::{DebugInfoData, HashSet};
-use cranelift_codegen::isa::TargetFrontendConfig;
-use failure::Error;
+use crate::DebugInfoData;
+use anyhow::Error;
 use gimli::{
     write, DebugAddr, DebugAddrBase, DebugLine, DebugStr, LocationLists, RangeLists,
     UnitSectionOffset,
 };
 use simulate::generate_simulated_dwarf;
+use std::collections::HashSet;
 use thiserror::Error;
 use unit::clone_unit;
+use wasmtime_environ::isa::TargetFrontendConfig;
 use wasmtime_environ::{ModuleAddressMap, ModuleVmctxInfo, ValueLabelsRanges};
 
 pub use address_transform::AddressTransform;
@@ -44,7 +45,7 @@ where
 }
 
 pub fn transform_dwarf(
-    target_config: &TargetFrontendConfig,
+    target_config: TargetFrontendConfig,
     di: &DebugInfoData,
     at: &ModuleAddressMap,
     vmctx_info: &ModuleVmctxInfo,

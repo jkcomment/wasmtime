@@ -1,11 +1,8 @@
 //! Memory management for executable code.
 
 use crate::function_table::FunctionTable;
-use alloc::boxed::Box;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::{cmp, mem};
 use region;
+use std::{cmp, mem};
 use wasmtime_environ::{Compilation, CompiledFunction};
 use wasmtime_runtime::{Mmap, VMFunctionBody};
 
@@ -15,6 +12,11 @@ pub struct CodeMemory {
     mmaps: Vec<(Mmap, FunctionTable)>,
     position: usize,
     published: usize,
+}
+
+fn _assert() {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    _assert_send_sync::<CodeMemory>();
 }
 
 impl CodeMemory {
@@ -80,7 +82,7 @@ impl CodeMemory {
             .expect("failed to push current memory map");
 
         for (m, t) in &mut self.mmaps[self.published..] {
-            if m.len() != 0 {
+            if !m.is_empty() {
                 unsafe {
                     region::protect(m.as_mut_ptr(), m.len(), region::Protection::ReadExecute)
                 }
@@ -182,7 +184,7 @@ impl CodeMemory {
             ),
         );
 
-        if previous.0.len() > 0 {
+        if !previous.0.is_empty() {
             self.mmaps.push(previous);
         } else {
             assert_eq!(previous.1.len(), 0);

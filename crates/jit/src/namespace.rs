@@ -2,9 +2,8 @@
 //! to exports. This file provides one possible way to manage multiple instances
 //! and resolve imports to exports among them.
 
-use super::HashMap;
 use crate::resolver::Resolver;
-use alloc::string::String;
+use std::collections::HashMap;
 use wasmtime_runtime::{Export, InstanceHandle};
 
 /// A namespace containing instances keyed by name.
@@ -37,7 +36,7 @@ impl Namespace {
 }
 
 impl Resolver for Namespace {
-    fn resolve(&mut self, name: &str, field: &str) -> Option<Export> {
+    fn resolve(&mut self, _idx: u32, name: &str, field: &str) -> Option<Export> {
         if let Some(instance) = self.names.get_mut(name) {
             instance.lookup(field)
         } else {

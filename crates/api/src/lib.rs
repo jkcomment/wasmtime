@@ -1,6 +1,10 @@
-//! Wasmtime embed API. Based on wasm-c-api.
-
-#![cfg_attr(not(feature = "std"), no_std)]
+//! Wasmtime's embedding API
+//!
+//! This crate contains a high-level API used to interact with WebAssembly
+//! modules. The API here is intended to mirror the proposed [WebAssembly C
+//! API](https://github.com/WebAssembly/wasm-c-api), with small extensions here
+//! and there to implement Rust idioms. This crate also defines the actual C API
+//! itself for consumption from other languages.
 
 mod callable;
 mod context;
@@ -16,19 +20,12 @@ mod values;
 
 pub mod wasm;
 
-extern crate alloc;
-
 pub use crate::callable::Callable;
 pub use crate::externals::*;
 pub use crate::instance::Instance;
 pub use crate::module::Module;
-pub use crate::r#ref::{AnyRef, HostInfo, HostRef};
-pub use crate::runtime::{Config, Engine, Store};
-pub use crate::trap::Trap;
+pub use crate::r#ref::AnyRef;
+pub use crate::runtime::{Config, Engine, OptLevel, Store, Strategy};
+pub use crate::trap::{FrameInfo, Trap};
 pub use crate::types::*;
 pub use crate::values::*;
-
-#[cfg(not(feature = "std"))]
-use hashbrown::{hash_map, HashMap, HashSet};
-#[cfg(feature = "std")]
-use std::collections::{hash_map, HashMap, HashSet};

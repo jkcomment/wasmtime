@@ -15,25 +15,28 @@ use crate::vmcontext::{
     VMGlobalDefinition, VMGlobalImport, VMMemoryDefinition, VMMemoryImport, VMSharedSignatureIndex,
     VMTableDefinition, VMTableImport,
 };
-use crate::{HashMap, HashSet};
-use alloc::borrow::ToOwned;
-use alloc::boxed::Box;
-use alloc::rc::Rc;
-use alloc::string::{String, ToString};
-use core::any::Any;
-use core::borrow::Borrow;
-use core::cell::RefCell;
-use core::convert::TryFrom;
-use core::{mem, ptr, slice};
-use cranelift_entity::{BoxedSlice, EntityRef, PrimaryMap};
-use cranelift_wasm::{
+use memoffset::offset_of;
+use more_asserts::assert_lt;
+use std::any::Any;
+use std::borrow::Borrow;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
+use std::ptr::NonNull;
+use std::rc::Rc;
+use std::{mem, ptr, slice};
+use thiserror::Error;
+use wasmtime_environ::entity::{BoxedSlice, EntityRef, PrimaryMap};
+use wasmtime_environ::wasm::{
     DefinedFuncIndex, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex, FuncIndex,
     GlobalIndex, GlobalInit, MemoryIndex, SignatureIndex, TableIndex,
 };
-use memoffset::offset_of;
-use more_asserts::assert_lt;
-use thiserror::Error;
 use wasmtime_environ::{DataInitializer, Module, TableElements, VMOffsets};
+
+thread_local! {
+    /// A stack of currently-running `Instance`s, if any.
+    pub(crate) static CURRENT_INSTANCE: RefCell<Vec<NonNull<Instance>>> = RefCell::new(Vec::new());
+}
 
 fn signature_id(
     vmctx: &VMContext,
@@ -178,6 +181,97 @@ fn global_mut<'vmctx>(
     }
 }
 
+cfg_if::cfg_if! {
+    if #[cfg(any(target_os = "linux", target_os = "macos"))] {
+        pub type SignalHandler = dyn Fn(libc::c_int, *const libc::siginfo_t, *const libc::c_void) -> bool;
+
+        pub fn signal_handler_none(
+            _signum: libc::c_int,
+            _siginfo: *const libc::siginfo_t,
+            _context: *const libc::c_void,
+        ) -> bool {
+            false
+        }
+
+        #[no_mangle]
+        pub extern "C" fn InstanceSignalHandler(
+            signum: libc::c_int,
+            siginfo: *mut libc::siginfo_t,
+            context: *mut libc::c_void,
+        ) -> bool {
+            CURRENT_INSTANCE.with(|current_instance| {
+                let current_instance = current_instance
+                    .try_borrow()
+                    .expect("borrow current instance");
+                if current_instance.is_empty() {
+                    return false;
+                } else {
+                    unsafe {
+                        let f = &current_instance
+                            .last()
+                            .expect("current instance not none")
+                            .as_ref()
+                            .signal_handler;
+                        f(signum, siginfo, context)
+                    }
+                }
+            })
+        }
+
+
+        impl InstanceHandle {
+            /// Set a custom signal handler
+            pub fn set_signal_handler<H>(&mut self, handler: H)
+            where
+                H: 'static + Fn(libc::c_int, *const libc::siginfo_t, *const libc::c_void) -> bool,
+            {
+                self.instance_mut().signal_handler = Box::new(handler) as Box<SignalHandler>;
+            }
+        }
+    } else if #[cfg(target_os = "windows")] {
+        pub type SignalHandler = dyn Fn(winapi::um::winnt::EXCEPTION_POINTERS) -> bool;
+
+        pub fn signal_handler_none(
+            _exception_info: winapi::um::winnt::EXCEPTION_POINTERS
+        ) -> bool {
+            false
+        }
+
+        #[no_mangle]
+        pub extern "C" fn InstanceSignalHandler(
+            exception_info: winapi::um::winnt::EXCEPTION_POINTERS
+        ) -> bool {
+            CURRENT_INSTANCE.with(|current_instance| {
+                let current_instance = current_instance
+                    .try_borrow()
+                    .expect("borrow current instance");
+                if current_instance.is_empty() {
+                    return false;
+                } else {
+                    unsafe {
+                        let f = &current_instance
+                            .last()
+                            .expect("current instance not none")
+                            .as_ref()
+                            .signal_handler;
+                        f(exception_info)
+                    }
+                }
+            })
+        }
+
+        impl InstanceHandle {
+            /// Set a custom signal handler
+            pub fn set_signal_handler<H>(&mut self, handler: H)
+            where
+                H: 'static + Fn(winapi::um::winnt::EXCEPTION_POINTERS) -> bool,
+            {
+                self.instance_mut().signal_handler = Box::new(handler) as Box<SignalHandler>;
+            }
+        }
+    }
+}
+
 /// A WebAssembly instance.
 ///
 /// This is repr(C) to ensure that the vmctx field is last.
@@ -219,6 +313,9 @@ pub(crate) struct Instance {
 
     /// Optional image of JIT'ed code for debugger registration.
     dbg_jit_registration: Option<Rc<GdbJitImageRegistration>>,
+
+    /// Handler run when `SIGBUS`, `SIGFPE`, `SIGILL`, or `SIGSEGV` are caught by the instance thread.
+    signal_handler: Box<SignalHandler>,
 
     /// Additional context used by compiled wasm code. This field is last, and
     /// represents a dynamically-sized array that extends beyond the nominal
@@ -399,9 +496,12 @@ impl Instance {
         Some(self.lookup_by_declaration(&export))
     }
 
-    /// Lookup an export with the given name. This takes an immutable reference,
-    /// and the result is an `Export` that the type system doesn't prevent from
-    /// being used to mutate the instance, so this function is unsafe.
+    /// Lookup an export with the given name.
+    ///
+    /// # Safety
+    /// This takes an immutable reference, and the result is an `Export` that
+    /// the type system doesn't prevent from being used to mutate the instance,
+    /// so this function is unsafe.
     pub unsafe fn lookup_immutable(&self, field: &str) -> Option<Export> {
         #[allow(clippy::cast_ref_to_mut)]
         let temporary_mut = &mut *(self as *const Self as *mut Self);
@@ -419,9 +519,12 @@ impl Instance {
         )
     }
 
-    /// Lookup an export with the given export declaration. This takes an immutable
-    /// reference, and the result is an `Export` that the type system doesn't prevent
-    /// from being used to mutate the instance, so this function is unsafe.
+    /// Lookup an export with the given export declaration.
+    ///
+    /// # Safety
+    /// This takes an immutable reference, and the result is an `Export` that
+    /// the type system doesn't prevent from being used to mutate the instance,
+    /// so this function is unsafe.
     pub unsafe fn lookup_immutable_by_declaration(
         &self,
         export: &wasmtime_environ::Export,
@@ -472,37 +575,6 @@ impl Instance {
     fn invoke_start_function(&mut self) -> Result<(), InstantiationError> {
         if let Some(start_index) = self.module.start_func {
             self.invoke_function(start_index)
-        } else if let Some(start_export) = self.module.exports.get("_start") {
-            // As a compatibility measure, if the module doesn't have a start
-            // function but does have a _start function exported, call that.
-            match *start_export {
-                wasmtime_environ::Export::Function(func_index) => {
-                    let sig = &self.module.signatures[self.module.functions[func_index]];
-                    // No wasm params or returns; just the vmctx param.
-                    if sig.params.len() == 1 && sig.returns.is_empty() {
-                        self.invoke_function(func_index)
-                    } else {
-                        Ok(())
-                    }
-                }
-                _ => Ok(()),
-            }
-        } else if let Some(main_export) = self.module.exports.get("main") {
-            // As a further compatibility measure, if the module doesn't have a
-            // start function or a _start function exported, but does have a main
-            // function exported, call that.
-            match *main_export {
-                wasmtime_environ::Export::Function(func_index) => {
-                    let sig = &self.module.signatures[self.module.functions[func_index]];
-                    // No wasm params or returns; just the vmctx param.
-                    if sig.params.len() == 1 && sig.returns.is_empty() {
-                        self.invoke_function(func_index)
-                    } else {
-                        Ok(())
-                    }
-                }
-                _ => Ok(()),
-            }
         } else {
             Ok(())
         }
@@ -579,8 +651,9 @@ impl Instance {
     /// Returns `None` if memory can't be grown by the specified amount
     /// of pages.
     ///
-    /// TODO: This and `imported_memory_size` are currently unsafe because
-    /// they dereference the memory import's pointers.
+    /// # Safety
+    /// This and `imported_memory_size` are currently unsafe because they
+    /// dereference the memory import's pointers.
     pub(crate) unsafe fn imported_memory_grow(
         &mut self,
         memory_index: MemoryIndex,
@@ -603,6 +676,10 @@ impl Instance {
     }
 
     /// Returns the number of allocated wasm pages in an imported memory.
+    ///
+    /// # Safety
+    /// This and `imported_memory_grow` are currently unsafe because they
+    /// dereference the memory import's pointers.
     pub(crate) unsafe fn imported_memory_size(&mut self, memory_index: MemoryIndex) -> u32 {
         let import = self.imported_memory(memory_index);
         let foreign_instance = (&mut *import.vmctx).instance();
@@ -613,10 +690,8 @@ impl Instance {
     }
 
     pub(crate) fn lookup_global_export(&self, field: &str) -> Option<Export> {
-        let cell: &RefCell<HashMap<alloc::string::String, core::option::Option<Export>>> =
-            self.global_exports.borrow();
-        let map: &mut HashMap<alloc::string::String, core::option::Option<Export>> =
-            &mut cell.borrow_mut();
+        let cell: &RefCell<HashMap<String, Option<Export>>> = self.global_exports.borrow();
+        let map: &mut HashMap<String, Option<Export>> = &mut cell.borrow_mut();
         if let Some(Some(export)) = map.get(field) {
             return Some(export.clone());
         }
@@ -672,6 +747,28 @@ pub struct InstanceHandle {
 }
 
 impl InstanceHandle {
+    #[doc(hidden)]
+    pub fn with_signals_on<F, R>(&self, action: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        CURRENT_INSTANCE.with(|current_instance| {
+            current_instance
+                .borrow_mut()
+                .push(unsafe { NonNull::new_unchecked(self.instance) });
+        });
+
+        let result = action();
+
+        CURRENT_INSTANCE.with(|current_instance| {
+            let mut current_instance = current_instance.borrow_mut();
+            assert!(!current_instance.is_empty());
+            current_instance.pop();
+        });
+
+        result
+    }
+
     /// Create a new `InstanceHandle` pointing at a new `Instance`.
     pub fn new(
         module: Rc<Module>,
@@ -724,6 +821,7 @@ impl InstanceHandle {
                 finished_functions,
                 dbg_jit_registration,
                 host_state,
+                signal_handler: Box::new(signal_handler_none) as Box<SignalHandler>,
                 vmctx: VMContext {},
             };
             unsafe {
@@ -790,11 +888,9 @@ impl InstanceHandle {
 
         // Collect the exports for the global export map.
         for (field, decl) in &instance.module.exports {
-            use crate::hash_map::Entry::*;
-            let cell: &RefCell<HashMap<alloc::string::String, core::option::Option<Export>>> =
-                instance.global_exports.borrow();
-            let map: &mut HashMap<alloc::string::String, core::option::Option<Export>> =
-                &mut cell.borrow_mut();
+            use std::collections::hash_map::Entry::*;
+            let cell: &RefCell<HashMap<String, Option<Export>>> = instance.global_exports.borrow();
+            let map: &mut HashMap<String, Option<Export>> = &mut cell.borrow_mut();
             match map.entry(field.to_string()) {
                 Vacant(entry) => {
                     entry.insert(Some(lookup_by_declaration(
@@ -823,6 +919,10 @@ impl InstanceHandle {
 
     /// Create a new `InstanceHandle` pointing at the instance
     /// pointed to by the given `VMContext` pointer.
+    ///
+    /// # Safety
+    /// This is unsafe because it doesn't work on just any `VMContext`, it must
+    /// be a `VMContext` allocated as part of an `Instance`.
     pub unsafe fn from_vmctx(vmctx: *mut VMContext) -> Self {
         let instance = (&mut *vmctx).instance();
         instance.refcount += 1;
@@ -864,9 +964,12 @@ impl InstanceHandle {
         self.instance_mut().lookup(field)
     }
 
-    /// Lookup an export with the given name. This takes an immutable reference,
-    /// and the result is an `Export` that the type system doesn't prevent from
-    /// being used to mutate the instance, so this function is unsafe.
+    /// Lookup an export with the given name.
+    ///
+    /// # Safety
+    /// This takes an immutable reference, and the result is an `Export` that
+    /// the type system doesn't prevent from being used to mutate the instance,
+    /// so this function is unsafe.
     pub unsafe fn lookup_immutable(&self, field: &str) -> Option<Export> {
         self.instance().lookup_immutable(field)
     }
@@ -876,9 +979,12 @@ impl InstanceHandle {
         self.instance_mut().lookup_by_declaration(export)
     }
 
-    /// Lookup an export with the given export declaration. This takes an immutable
-    /// reference, and the result is an `Export` that the type system doesn't prevent
-    /// from being used to mutate the instance, so this function is unsafe.
+    /// Lookup an export with the given export declaration.
+    ///
+    /// # Safety
+    /// This takes an immutable reference, and the result is an `Export` that
+    /// the type system doesn't prevent from being used to mutate the instance,
+    /// so this function is unsafe.
     pub unsafe fn lookup_immutable_by_declaration(
         &self,
         export: &wasmtime_environ::Export,
@@ -888,7 +994,7 @@ impl InstanceHandle {
 
     /// Return an iterator over the exports of this instance.
     ///
-    /// Specifically, it provides access to the key-value pairs, where they keys
+    /// Specifically, it provides access to the key-value pairs, where the keys
     /// are export names, and the values are export declarations which can be
     /// resolved `lookup_by_declaration`.
     pub fn exports(&self) -> indexmap::map::Iter<String, wasmtime_environ::Export> {
@@ -1270,6 +1376,7 @@ fn initialize_globals(instance: &mut Instance) {
                 unsafe { *to = *from };
             }
             GlobalInit::Import => panic!("locally-defined global initialized as import"),
+            GlobalInit::RefNullConst => unimplemented!(),
         }
     }
 }

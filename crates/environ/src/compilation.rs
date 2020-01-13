@@ -1,11 +1,10 @@
 //! A `Compilation` contains the compiled function bodies for a WebAssembly
 //! module.
 
-use crate::address_map::{ModuleAddressMap, ValueLabelsRanges};
+use crate::cache::ModuleCacheDataTupleType;
 use crate::module;
 use crate::module_environ::FunctionBodyData;
-use alloc::vec::Vec;
-use cranelift_codegen::{binemit, ir, isa, CodegenError};
+use cranelift_codegen::{binemit, ir, isa};
 use cranelift_entity::PrimaryMap;
 use cranelift_wasm::{DefinedFuncIndex, FuncIndex, ModuleTranslationState, WasmError};
 use serde::{Deserialize, Serialize};
@@ -65,6 +64,11 @@ impl Compilation {
     /// Gets the number of functions defined.
     pub fn len(&self) -> usize {
         self.functions.len()
+    }
+
+    /// Returns whether there are no functions defined.
+    pub fn is_empty(&self) -> bool {
+        self.functions.is_empty()
     }
 
     /// Gets functions jump table offsets.
@@ -156,8 +160,8 @@ pub enum CompileError {
     Wasm(#[from] WasmError),
 
     /// A compilation error occured.
-    #[error("Compilation error")]
-    Codegen(#[from] CodegenError),
+    #[error("Compilation error: {0}")]
+    Codegen(String),
 
     /// A compilation error occured.
     #[error("Debug info is not supported with this configuration")]
@@ -173,15 +177,5 @@ pub trait Compiler {
         function_body_inputs: PrimaryMap<DefinedFuncIndex, FunctionBodyData<'data>>,
         isa: &dyn isa::TargetIsa,
         generate_debug_info: bool,
-    ) -> Result<
-        (
-            Compilation,
-            Relocations,
-            ModuleAddressMap,
-            ValueLabelsRanges,
-            PrimaryMap<DefinedFuncIndex, ir::StackSlots>,
-            Traps,
-        ),
-        CompileError,
-    >;
+    ) -> Result<ModuleCacheDataTupleType, CompileError>;
 }

@@ -1,26 +1,22 @@
 use super::create_handle::create_handle;
 use crate::{TableType, ValType};
-use alloc::boxed::Box;
-use alloc::string::ToString;
-use anyhow::Result;
-use cranelift_entity::PrimaryMap;
-use cranelift_wasm::TableElementType;
-use wasmtime_environ::Module;
+use anyhow::{bail, Result};
+use wasmtime_environ::entity::PrimaryMap;
+use wasmtime_environ::{wasm, Module};
 use wasmtime_runtime::InstanceHandle;
 
 pub fn create_handle_with_table(table: &TableType) -> Result<InstanceHandle> {
     let mut module = Module::new();
 
-    let table = cranelift_wasm::Table {
+    let table = wasm::Table {
         minimum: table.limits().min(),
-        maximum: if table.limits().max() == core::u32::MAX {
-            None
-        } else {
-            Some(table.limits().max())
-        },
+        maximum: table.limits().max(),
         ty: match table.element() {
-            ValType::FuncRef => TableElementType::Func,
-            _ => TableElementType::Val(table.element().get_cranelift_type()),
+            ValType::FuncRef => wasm::TableElementType::Func,
+            _ => match table.element().get_wasmtime_type() {
+                Some(t) => wasm::TableElementType::Val(t),
+                None => bail!("cannot support {:?} as a table element", table.element()),
+            },
         },
     };
     let tunable = Default::default();

@@ -2,13 +2,14 @@ use crate::backend::TranslatedCodeSection;
 use crate::error::Error;
 use crate::microwasm;
 use crate::translate_sections;
-use core::{convert::TryInto, mem};
 use cranelift_codegen::{
     ir::{self, AbiParam, Signature as CraneliftSignature},
     isa,
 };
 use memoffset::offset_of;
-use more_asserts::assert_le;
+
+use std::{convert::TryInto, mem};
+use thiserror::Error;
 use wasmparser::{FuncType, MemoryType, ModuleReader, SectionCode, Type};
 
 pub trait AsValueType {
@@ -133,9 +134,11 @@ impl TranslatedModule {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Error)]
 pub enum ExecutionError {
+    #[error("function index out of bounds")]
     FuncIndexOutOfBounds,
+    #[error("type mismatch")]
     TypeMismatch,
 }
 
@@ -145,8 +148,12 @@ pub struct ExecutableModule {
 }
 
 impl ExecutableModule {
-    /// Executes the function _without checking types_. This can cause undefined
-    /// memory to be accessed.
+    /// Executes the function identified by `func_idx`.
+    ///
+    /// # Safety
+    ///
+    /// Executes the function _without_ checking the argument types.
+    /// This can cause undefined memory to be accessed.
     pub unsafe fn execute_func_unchecked<Args: FunctionArgs<T>, T>(
         &self,
         func_idx: u32,
@@ -164,7 +171,7 @@ impl ExecutableModule {
             self.context
                 .as_ref()
                 .map(|ctx| (&**ctx) as *const VmCtx as *const u8)
-                .unwrap_or(core::ptr::null()),
+                .unwrap_or(std::ptr::null()),
         )
     }
 
@@ -556,15 +563,19 @@ pub fn translate_only(data: &[u8]) -> Result<TranslatedModule, Error> {
         let memories = section.get_memory_section_reader()?;
         let mem = translate_sections::memory(memories)?;
 
-        assert_le!(
-            mem.len(),
-            1,
-            "Multiple memory sections not yet unimplemented"
-        );
+        if mem.len() > 1 {
+            return Err(Error::Input(
+                "Multiple memory sections not yet implemented".to_string(),
+            ));
+        }
 
         if !mem.is_empty() {
             let mem = mem[0];
-            assert_eq!(Some(mem.limits.initial), mem.limits.maximum);
+            if Some(mem.limits.initial) != mem.limits.maximum {
+                return Err(Error::Input(
+                    "Custom memory limits not supported in lightbeam".to_string(),
+                ));
+            }
             output.memory = Some(mem);
         }
 
@@ -635,7 +646,11 @@ pub fn translate_only(data: &[u8]) -> Result<TranslatedModule, Error> {
         translate_sections::data(data)?;
     }
 
-    assert!(reader.eof());
+    if !reader.eof() {
+        return Err(Error::Input(
+            "Unexpected data found after the end of the module".to_string(),
+        ));
+    }
 
     Ok(output)
 }

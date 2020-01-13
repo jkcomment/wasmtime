@@ -4,7 +4,7 @@ use crate::fdentry::Descriptor;
 use crate::memory::*;
 use crate::sys::hostcalls_impl;
 use crate::{wasi, wasi32, Error, Result};
-use log::trace;
+use log::{error, trace};
 use std::convert::TryFrom;
 
 pub(crate) fn args_get(
@@ -128,22 +128,23 @@ pub(crate) fn environ_sizes_get(
 }
 
 pub(crate) fn random_get(
+    _wasi_ctx: &WasiCtx,
     memory: &mut [u8],
     buf_ptr: wasi32::uintptr_t,
     buf_len: wasi32::size_t,
 ) -> Result<()> {
-    use rand::{thread_rng, RngCore};
-
     trace!("random_get(buf_ptr={:#x?}, buf_len={:?})", buf_ptr, buf_len);
 
     let buf = dec_slice_of_mut_u8(memory, buf_ptr, buf_len)?;
 
-    thread_rng().fill_bytes(buf);
-
-    Ok(())
+    getrandom::getrandom(buf).map_err(|err| {
+        error!("getrandom failure: {:?}", err);
+        Error::EIO
+    })
 }
 
 pub(crate) fn clock_res_get(
+    _wasi_ctx: &WasiCtx,
     memory: &mut [u8],
     clock_id: wasi::__wasi_clockid_t,
     resolution_ptr: wasi32::uintptr_t,
@@ -162,6 +163,7 @@ pub(crate) fn clock_res_get(
 }
 
 pub(crate) fn clock_time_get(
+    _wasi_ctx: &WasiCtx,
     memory: &mut [u8],
     clock_id: wasi::__wasi_clockid_t,
     precision: wasi::__wasi_timestamp_t,
@@ -181,7 +183,7 @@ pub(crate) fn clock_time_get(
     enc_timestamp_byref(memory, time_ptr, time)
 }
 
-pub(crate) fn sched_yield() -> Result<()> {
+pub(crate) fn sched_yield(_wasi_ctx: &WasiCtx, _memory: &mut [u8]) -> Result<()> {
     trace!("sched_yield()");
 
     std::thread::yield_now();
@@ -240,9 +242,9 @@ pub(crate) fn poll_oneoff(
             {
                 let wasi_fd = unsafe { subscription.u.fd_readwrite.file_descriptor };
                 let rights = if r#type == wasi::__WASI_EVENTTYPE_FD_READ {
-                    wasi::__WASI_RIGHT_FD_READ
+                    wasi::__WASI_RIGHTS_FD_READ | wasi::__WASI_RIGHTS_POLL_FD_READWRITE
                 } else {
-                    wasi::__WASI_RIGHT_FD_WRITE
+                    wasi::__WASI_RIGHTS_FD_WRITE | wasi::__WASI_RIGHTS_POLL_FD_READWRITE
                 };
 
                 match unsafe {
@@ -260,7 +262,7 @@ pub(crate) fn poll_oneoff(
                             userdata: subscription.userdata,
                             r#type,
                             error: err.as_wasi_errno(),
-                            u: wasi::__wasi_event_u {
+                            u: wasi::__wasi_event_u_t {
                                 fd_readwrite: wasi::__wasi_event_fd_readwrite_t {
                                     nbytes: 0,
                                     flags: 0,
@@ -292,7 +294,7 @@ pub(crate) fn poll_oneoff(
 fn wasi_clock_to_relative_ns_delay(wasi_clock: wasi::__wasi_subscription_clock_t) -> Result<u128> {
     use std::time::SystemTime;
 
-    if wasi_clock.flags != wasi::__WASI_SUBSCRIPTION_CLOCK_ABSTIME {
+    if wasi_clock.flags != wasi::__WASI_SUBCLOCKFLAGS_SUBSCRIPTION_CLOCK_ABSTIME {
         return Ok(u128::from(wasi_clock.timeout));
     }
     let now: u128 = SystemTime::now()

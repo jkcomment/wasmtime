@@ -1,11 +1,10 @@
 use super::address_transform::AddressTransform;
 use super::{DebugInputContext, Reader};
-use alloc::vec::Vec;
-use cranelift_entity::EntityRef;
-use cranelift_wasm::DefinedFuncIndex;
-use failure::Error;
+use anyhow::Error;
 use gimli::{write, AttributeValue, DebuggingInformationEntry, RangeListsOffset};
 use more_asserts::assert_lt;
+use wasmtime_environ::entity::EntityRef;
+use wasmtime_environ::wasm::DefinedFuncIndex;
 
 pub(crate) enum RangeInfoBuilder {
     Undefined,
@@ -68,10 +67,10 @@ impl RangeInfoBuilder {
             result.push((range.begin, range.end));
         }
 
-        Ok(if result.len() > 0 {
-            RangeInfoBuilder::Ranges(result)
-        } else {
+        Ok(if result.is_empty() {
             RangeInfoBuilder::Undefined
+        } else {
+            RangeInfoBuilder::Ranges(result)
         })
     }
 

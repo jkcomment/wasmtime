@@ -1,22 +1,19 @@
 //! Support for a calling of an imported function.
 
 use crate::runtime::Store;
-use crate::{HashMap, HashSet};
-use alloc::boxed::Box;
-use alloc::rc::Rc;
-use alloc::string::String;
-use alloc::vec::Vec;
 use anyhow::Result;
-use core::any::Any;
-use core::cell::{RefCell, RefMut};
-use cranelift_entity::PrimaryMap;
-use cranelift_wasm::DefinedFuncIndex;
+use std::any::Any;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use wasmtime_environ::entity::PrimaryMap;
+use wasmtime_environ::wasm::DefinedFuncIndex;
 use wasmtime_environ::Module;
 use wasmtime_runtime::{Imports, InstanceHandle, VMFunctionBody};
 
 pub(crate) fn create_handle(
     module: Module,
-    signature_registry: Option<RefMut<Store>>,
+    signature_registry: Option<&Store>,
     finished_functions: PrimaryMap<DefinedFuncIndex, *const VMFunctionBody>,
     state: Box<dyn Any>,
 ) -> Result<InstanceHandle> {
@@ -34,16 +31,14 @@ pub(crate) fn create_handle(
 
     // Compute indices into the shared signature table.
     let signatures = signature_registry
-        .and_then(|mut signature_registry| {
-            Some(
-                module
-                    .signatures
-                    .values()
-                    .map(|sig| signature_registry.register_cranelift_signature(sig))
-                    .collect::<PrimaryMap<_, _>>(),
-            )
+        .map(|signature_registry| {
+            module
+                .signatures
+                .values()
+                .map(|sig| signature_registry.register_wasmtime_signature(sig))
+                .collect::<PrimaryMap<_, _>>()
         })
-        .unwrap_or_else(|| PrimaryMap::new());
+        .unwrap_or_else(PrimaryMap::new);
 
     Ok(InstanceHandle::new(
         Rc::new(module),

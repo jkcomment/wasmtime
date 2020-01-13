@@ -1,14 +1,12 @@
 use super::address_transform::AddressTransform;
-use crate::{HashMap, HashSet};
-use alloc::vec::Vec;
-use cranelift_codegen::ir::{StackSlots, ValueLabel, ValueLoc};
-use cranelift_codegen::isa::RegUnit;
-use cranelift_codegen::ValueLabelsRanges;
-use cranelift_entity::EntityRef;
-use cranelift_wasm::{get_vmctx_value_label, DefinedFuncIndex};
-use failure::Error;
+use anyhow::Error;
 use gimli::{self, write, Expression, Operation, Reader, ReaderOffset, Register, X86_64};
 use more_asserts::{assert_le, assert_lt};
+use std::collections::{HashMap, HashSet};
+use wasmtime_environ::entity::EntityRef;
+use wasmtime_environ::ir::{StackSlots, ValueLabel, ValueLabelsRanges, ValueLoc};
+use wasmtime_environ::isa::RegUnit;
+use wasmtime_environ::wasm::{get_vmctx_value_label, DefinedFuncIndex};
 
 #[derive(Debug)]
 pub struct FunctionFrameInfo<'a> {
@@ -201,7 +199,7 @@ impl CompiledExpression {
         addr_tr: &AddressTransform,
         frame_info: Option<&FunctionFrameInfo>,
         endian: gimli::RunTimeEndian,
-    ) -> alloc::vec::Vec<(write::Address, u64, write::Expression)> {
+    ) -> Vec<(write::Address, u64, write::Expression)> {
         if scope.is_empty() {
             return vec![];
         }
@@ -325,7 +323,7 @@ where
             assert_eq!(ty, 0);
             let index = pc.read_sleb128()?;
             pc.read_u8()?; // consume 159
-            if code_chunk.len() > 0 {
+            if !code_chunk.is_empty() {
                 parts.push(CompiledExpressionPart::Code(code_chunk));
                 code_chunk = Vec::new();
             }
@@ -340,7 +338,7 @@ where
                     need_deref = false;
                 }
                 Operation::Deref { .. } => {
-                    if code_chunk.len() > 0 {
+                    if !code_chunk.is_empty() {
                         parts.push(CompiledExpressionPart::Code(code_chunk));
                         code_chunk = Vec::new();
                     }
@@ -355,14 +353,14 @@ where
         }
     }
 
-    if code_chunk.len() > 0 {
+    if !code_chunk.is_empty() {
         parts.push(CompiledExpressionPart::Code(code_chunk));
     }
 
     if base_len > 0 && base_len + 1 < parts.len() {
         // see if we can glue two code chunks
         if let [CompiledExpressionPart::Code(cc1), CompiledExpressionPart::Code(cc2)] =
-            &parts[base_len..base_len + 1]
+            &parts[base_len..=base_len]
         {
             let mut combined = cc1.clone();
             combined.extend_from_slice(cc2);

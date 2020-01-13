@@ -1,60 +1,74 @@
-use alloc::borrow::ToOwned;
-use alloc::boxed::Box;
-use alloc::string::String;
-use alloc::vec::Vec;
-use cranelift_codegen::ir;
+use wasmtime_environ::{ir, wasm};
 
 // Type Representations
 
 // Type attributes
 
+/// Indicator of whether a global is mutable or not
 #[derive(Debug, Clone, Copy)]
 pub enum Mutability {
+    /// The global is constant and its value does not change
     Const,
+    /// The value of the global can change over time
     Var,
 }
 
+/// Limits of tables/memories where the units of the limits are defined by the
+/// table/memory types.
+///
+/// A minimum is always available but the maximum may not be present.
 #[derive(Debug, Clone)]
 pub struct Limits {
     min: u32,
-    max: u32,
+    max: Option<u32>,
 }
 
 impl Limits {
-    pub fn new(min: u32, max: u32) -> Limits {
+    /// Creates a new set of limits with the minimum and maximum both specified.
+    pub fn new(min: u32, max: Option<u32>) -> Limits {
         Limits { min, max }
     }
 
+    /// Creates a new `Limits` with the `min` specified and no maximum specified.
     pub fn at_least(min: u32) -> Limits {
-        Limits {
-            min,
-            max: ::core::u32::MAX,
-        }
+        Limits::new(min, None)
     }
 
+    /// Returns the minimum amount for these limits.
     pub fn min(&self) -> u32 {
         self.min
     }
 
-    pub fn max(&self) -> u32 {
+    /// Returns the maximum amount for these limits, if specified.
+    pub fn max(&self) -> Option<u32> {
         self.max
     }
 }
 
 // Value Types
 
+/// A list of all possible value types in WebAssembly.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ValType {
+    /// Signed 32 bit integer.
     I32,
+    /// Signed 64 bit integer.
     I64,
+    /// Floating point 32 bit integer.
     F32,
+    /// Floating point 64 bit integer.
     F64,
+    /// A 128 bit number.
     V128,
+    /// A reference to opaque data in the Wasm instance.
     AnyRef, /* = 128 */
+    /// A reference to a Wasm function.
     FuncRef,
 }
 
 impl ValType {
+    /// Returns true if `ValType` matches any of the numeric types. (e.g. `I32`,
+    /// `I64`, `F32`, `F64`).
     pub fn is_num(&self) -> bool {
         match self {
             ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64 => true,
@@ -62,6 +76,7 @@ impl ValType {
         }
     }
 
+    /// Returns true if `ValType` matches either of the reference types.
     pub fn is_ref(&self) -> bool {
         match self {
             ValType::AnyRef | ValType::FuncRef => true,
@@ -69,157 +84,200 @@ impl ValType {
         }
     }
 
-    pub(crate) fn get_cranelift_type(&self) -> ir::Type {
+    pub(crate) fn get_wasmtime_type(&self) -> Option<ir::Type> {
         match self {
-            ValType::I32 => ir::types::I32,
-            ValType::I64 => ir::types::I64,
-            ValType::F32 => ir::types::F32,
-            ValType::F64 => ir::types::F64,
-            ValType::V128 => ir::types::I8X16,
-            _ => unimplemented!("get_cranelift_type other"),
+            ValType::I32 => Some(ir::types::I32),
+            ValType::I64 => Some(ir::types::I64),
+            ValType::F32 => Some(ir::types::F32),
+            ValType::F64 => Some(ir::types::F64),
+            ValType::V128 => Some(ir::types::I8X16),
+            _ => None,
         }
     }
 
-    pub(crate) fn from_cranelift_type(ty: ir::Type) -> ValType {
+    pub(crate) fn from_wasmtime_type(ty: ir::Type) -> Option<ValType> {
         match ty {
-            ir::types::I32 => ValType::I32,
-            ir::types::I64 => ValType::I64,
-            ir::types::F32 => ValType::F32,
-            ir::types::F64 => ValType::F64,
-            ir::types::I8X16 => ValType::V128,
-            _ => unimplemented!("from_cranelift_type other"),
+            ir::types::I32 => Some(ValType::I32),
+            ir::types::I64 => Some(ValType::I64),
+            ir::types::F32 => Some(ValType::F32),
+            ir::types::F64 => Some(ValType::F64),
+            ir::types::I8X16 => Some(ValType::V128),
+            _ => None,
         }
     }
 }
 
 // External Types
 
+/// A list of all possible types which can be externally referenced from a
+/// WebAssembly module.
+///
+/// This list can be found in [`ImportType`] or [`ExportType`], so these types
+/// can either be imported or exported.
 #[derive(Debug, Clone)]
 pub enum ExternType {
-    ExternFunc(FuncType),
-    ExternGlobal(GlobalType),
-    ExternTable(TableType),
-    ExternMemory(MemoryType),
+    Func(FuncType),
+    Global(GlobalType),
+    Table(TableType),
+    Memory(MemoryType),
+}
+
+macro_rules! accessors {
+    ($(($variant:ident($ty:ty) $get:ident $unwrap:ident))*) => ($(
+        /// Attempt to return the underlying type of this external type,
+        /// returning `None` if it is a different type.
+        pub fn $get(&self) -> Option<&$ty> {
+            if let ExternType::$variant(e) = self {
+                Some(e)
+            } else {
+                None
+            }
+        }
+
+        /// Returns the underlying descriptor of this [`ExternType`], panicking
+        /// if it is a different type.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `self` is not of the right type.
+        pub fn $unwrap(&self) -> &$ty {
+            self.$get().expect(concat!("expected ", stringify!($ty)))
+        }
+    )*)
 }
 
 impl ExternType {
-    pub fn func(&self) -> &FuncType {
-        match self {
-            ExternType::ExternFunc(func) => func,
-            _ => panic!("ExternType::ExternFunc expected"),
-        }
+    accessors! {
+        (Func(FuncType) func unwrap_func)
+        (Global(GlobalType) global unwrap_global)
+        (Table(TableType) table unwrap_table)
+        (Memory(MemoryType) memory unwrap_memory)
     }
-    pub fn global(&self) -> &GlobalType {
-        match self {
-            ExternType::ExternGlobal(func) => func,
-            _ => panic!("ExternType::ExternGlobal expected"),
-        }
-    }
-    pub fn table(&self) -> &TableType {
-        match self {
-            ExternType::ExternTable(table) => table,
-            _ => panic!("ExternType::ExternTable expected"),
-        }
-    }
-    pub fn memory(&self) -> &MemoryType {
-        match self {
-            ExternType::ExternMemory(memory) => memory,
-            _ => panic!("ExternType::ExternMemory expected"),
-        }
-    }
-    pub(crate) fn from_wasmtime_export(export: &wasmtime_runtime::Export) -> Self {
-        match export {
+
+    /// Returns `None` if the sub-type fails to get converted, see documentation
+    /// for sub-types about what may fail.
+    pub(crate) fn from_wasmtime_export(export: &wasmtime_runtime::Export) -> Option<Self> {
+        Some(match export {
             wasmtime_runtime::Export::Function { signature, .. } => {
-                ExternType::ExternFunc(FuncType::from_cranelift_signature(signature.clone()))
+                ExternType::Func(FuncType::from_wasmtime_signature(signature.clone())?)
             }
             wasmtime_runtime::Export::Memory { memory, .. } => {
-                ExternType::ExternMemory(MemoryType::from_cranelift_memory(&memory.memory))
+                ExternType::Memory(MemoryType::from_wasmtime_memory(&memory.memory))
             }
             wasmtime_runtime::Export::Global { global, .. } => {
-                ExternType::ExternGlobal(GlobalType::from_cranelift_global(&global))
+                ExternType::Global(GlobalType::from_wasmtime_global(&global)?)
             }
             wasmtime_runtime::Export::Table { table, .. } => {
-                ExternType::ExternTable(TableType::from_cranelift_table(&table.table))
+                ExternType::Table(TableType::from_wasmtime_table(&table.table))
             }
-        }
+        })
     }
 }
 
 // Function Types
-fn from_cranelift_abiparam(param: &ir::AbiParam) -> ValType {
+fn from_wasmtime_abiparam(param: &ir::AbiParam) -> Option<ValType> {
     assert_eq!(param.purpose, ir::ArgumentPurpose::Normal);
-    ValType::from_cranelift_type(param.value_type)
+    ValType::from_wasmtime_type(param.value_type)
 }
 
+/// A descriptor for a function in a WebAssembly module.
+///
+/// WebAssembly functions can have 0 or more parameters and results.
 #[derive(Debug, Clone)]
 pub struct FuncType {
     params: Box<[ValType]>,
     results: Box<[ValType]>,
-    signature: ir::Signature,
+    // `None` if params/results aren't wasm-compatible (e.g. use wasm interface
+    // types), or if they're not implemented (like anyref at the time of this
+    // writing)
+    //
+    // `Some` if they're all wasm-compatible.
+    signature: Option<ir::Signature>,
 }
 
 impl FuncType {
+    /// Creates a new function descriptor from the given parameters and results.
+    ///
+    /// The function descriptor returned will represent a function which takes
+    /// `params` as arguments and returns `results` when it is finished.
     pub fn new(params: Box<[ValType]>, results: Box<[ValType]>) -> FuncType {
-        use cranelift_codegen::ir::*;
-        use cranelift_codegen::isa::CallConv;
-        use target_lexicon::HOST;
-        let call_conv = CallConv::triple_default(&HOST);
-        let signature: Signature = {
-            let mut params = params
-                .iter()
-                .map(|p| AbiParam::new(p.get_cranelift_type()))
-                .collect::<Vec<_>>();
-            let returns = results
-                .iter()
-                .map(|p| AbiParam::new(p.get_cranelift_type()))
-                .collect::<Vec<_>>();
-            params.insert(0, AbiParam::special(types::I64, ArgumentPurpose::VMContext));
+        use wasmtime_environ::ir::{types, AbiParam, ArgumentPurpose, Signature};
+        use wasmtime_jit::native;
+        let call_conv = native::call_conv();
+        let signature = params
+            .iter()
+            .map(|p| p.get_wasmtime_type().map(AbiParam::new))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|params| {
+                results
+                    .iter()
+                    .map(|p| p.get_wasmtime_type().map(AbiParam::new))
+                    .collect::<Option<Vec<_>>>()
+                    .map(|results| (params, results))
+            })
+            .map(|(mut params, returns)| {
+                params.insert(0, AbiParam::special(types::I64, ArgumentPurpose::VMContext));
 
-            Signature {
-                params,
-                returns,
-                call_conv,
-            }
-        };
+                Signature {
+                    params,
+                    returns,
+                    call_conv,
+                }
+            });
         FuncType {
             params,
             results,
             signature,
         }
     }
+
+    /// Returns the list of parameter types for this function.
     pub fn params(&self) -> &[ValType] {
         &self.params
     }
+
+    /// Returns the list of result types for this function.
     pub fn results(&self) -> &[ValType] {
         &self.results
     }
 
-    pub(crate) fn get_cranelift_signature(&self) -> &ir::Signature {
-        &self.signature
+    /// Returns `Some` if this function signature was compatible with cranelift,
+    /// or `None` if one of the types/results wasn't supported or compatible
+    /// with cranelift.
+    pub(crate) fn get_wasmtime_signature(&self) -> Option<&ir::Signature> {
+        self.signature.as_ref()
     }
 
-    pub(crate) fn from_cranelift_signature(signature: ir::Signature) -> FuncType {
+    /// Returns `None` if any types in the signature can't be converted to the
+    /// types in this crate, but that should very rarely happen and largely only
+    /// indicate a bug in our cranelift integration.
+    pub(crate) fn from_wasmtime_signature(signature: ir::Signature) -> Option<FuncType> {
         let params = signature
             .params
             .iter()
             .filter(|p| p.purpose == ir::ArgumentPurpose::Normal)
-            .map(|p| from_cranelift_abiparam(p))
-            .collect::<Vec<_>>();
+            .map(|p| from_wasmtime_abiparam(p))
+            .collect::<Option<Vec<_>>>()?;
         let results = signature
             .returns
             .iter()
-            .map(|p| from_cranelift_abiparam(p))
-            .collect::<Vec<_>>();
-        FuncType {
+            .map(|p| from_wasmtime_abiparam(p))
+            .collect::<Option<Vec<_>>>()?;
+        Some(FuncType {
             params: params.into_boxed_slice(),
             results: results.into_boxed_slice(),
-            signature,
-        }
+            signature: Some(signature),
+        })
     }
 }
 
 // Global Types
 
+/// A WebAssembly global descriptor.
+///
+/// This type describes an instance of a global in a WebAssembly module. Globals
+/// are local to an [`Instance`](crate::Instance) and are either immutable or
+/// mutable.
 #[derive(Debug, Clone)]
 pub struct GlobalType {
     content: ValType,
@@ -227,32 +285,45 @@ pub struct GlobalType {
 }
 
 impl GlobalType {
+    /// Creates a new global descriptor of the specified `content` type and
+    /// whether or not it's mutable.
     pub fn new(content: ValType, mutability: Mutability) -> GlobalType {
         GlobalType {
             content,
             mutability,
         }
     }
+
+    /// Returns the value type of this global descriptor.
     pub fn content(&self) -> &ValType {
         &self.content
     }
+
+    /// Returns whether or not this global is mutable.
     pub fn mutability(&self) -> Mutability {
         self.mutability
     }
 
-    pub(crate) fn from_cranelift_global(global: &cranelift_wasm::Global) -> GlobalType {
-        let ty = ValType::from_cranelift_type(global.ty);
+    /// Returns `None` if the wasmtime global has a type that we can't
+    /// represent, but that should only very rarely happen and indicate a bug.
+    pub(crate) fn from_wasmtime_global(global: &wasm::Global) -> Option<GlobalType> {
+        let ty = ValType::from_wasmtime_type(global.ty)?;
         let mutability = if global.mutability {
             Mutability::Var
         } else {
             Mutability::Const
         };
-        GlobalType::new(ty, mutability)
+        Some(GlobalType::new(ty, mutability))
     }
 }
 
 // Table Types
 
+/// A descriptor for a table in a WebAssembly module.
+///
+/// Tables are contiguous chunks of a specific element, typically a `funcref` or
+/// an `anyref`. The most common use for tables is a function table through
+/// which `call_indirect` can invoke other functions.
 #[derive(Debug, Clone)]
 pub struct TableType {
     element: ValType,
@@ -260,120 +331,136 @@ pub struct TableType {
 }
 
 impl TableType {
+    /// Creates a new table descriptor which will contain the specified
+    /// `element` and have the `limits` applied to its length.
     pub fn new(element: ValType, limits: Limits) -> TableType {
         TableType { element, limits }
     }
+
+    /// Returns the element value type of this table.
     pub fn element(&self) -> &ValType {
         &self.element
     }
+
+    /// Returns the limits, in units of elements, of this table.
     pub fn limits(&self) -> &Limits {
         &self.limits
     }
 
-    pub(crate) fn from_cranelift_table(table: &cranelift_wasm::Table) -> TableType {
-        assert!(if let cranelift_wasm::TableElementType::Func = table.ty {
+    pub(crate) fn from_wasmtime_table(table: &wasm::Table) -> TableType {
+        assert!(if let wasm::TableElementType::Func = table.ty {
             true
         } else {
             false
         });
         let ty = ValType::FuncRef;
-        let limits = Limits::new(table.minimum, table.maximum.unwrap_or(::core::u32::MAX));
+        let limits = Limits::new(table.minimum, table.maximum);
         TableType::new(ty, limits)
     }
 }
 
 // Memory Types
 
+/// A descriptor for a WebAssembly memory type.
+///
+/// Memories are described in units of pages (64KB) and represent contiguous
+/// chunks of addressable memory.
 #[derive(Debug, Clone)]
 pub struct MemoryType {
     limits: Limits,
 }
 
 impl MemoryType {
+    /// Creates a new descriptor for a WebAssembly memory given the specified
+    /// limits of the memory.
     pub fn new(limits: Limits) -> MemoryType {
         MemoryType { limits }
     }
+
+    /// Returns the limits (in pages) that are configured for this memory.
     pub fn limits(&self) -> &Limits {
         &self.limits
     }
 
-    pub(crate) fn from_cranelift_memory(memory: &cranelift_wasm::Memory) -> MemoryType {
-        MemoryType::new(Limits::new(
-            memory.minimum,
-            memory.maximum.unwrap_or(::core::u32::MAX),
-        ))
+    pub(crate) fn from_wasmtime_memory(memory: &wasm::Memory) -> MemoryType {
+        MemoryType::new(Limits::new(memory.minimum, memory.maximum))
     }
 }
 
 // Import Types
 
-#[derive(Debug, Clone)]
-pub struct Name(String);
-
-impl Name {
-    pub fn new(value: &str) -> Self {
-        Name(value.to_owned())
-    }
-
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-}
-
-impl From<String> for Name {
-    fn from(s: String) -> Name {
-        Name(s)
-    }
-}
-
-impl ::alloc::string::ToString for Name {
-    fn to_string(&self) -> String {
-        self.0.to_owned()
-    }
-}
-
+/// A descriptor for an imported value into a wasm module.
+///
+/// This type is primarily accessed from the
+/// [`Module::imports`](crate::Module::imports) API. Each [`ImportType`]
+/// describes an import into the wasm module with the module/name that it's
+/// imported from as well as the type of item that's being imported.
 #[derive(Debug, Clone)]
 pub struct ImportType {
-    module: Name,
-    name: Name,
-    r#type: ExternType,
+    module: String,
+    name: String,
+    ty: ExternType,
 }
 
 impl ImportType {
-    pub fn new(module: Name, name: Name, r#type: ExternType) -> ImportType {
+    /// Creates a new import descriptor which comes from `module` and `name` and
+    /// is of type `ty`.
+    pub fn new(module: &str, name: &str, ty: ExternType) -> ImportType {
         ImportType {
-            module,
-            name,
-            r#type,
+            module: module.to_string(),
+            name: name.to_string(),
+            ty,
         }
     }
-    pub fn module(&self) -> &Name {
+
+    /// Returns the module name that this import is expected to come from.
+    pub fn module(&self) -> &str {
         &self.module
     }
-    pub fn name(&self) -> &Name {
+
+    /// Returns the field name of the module that this import is expected to
+    /// come from.
+    pub fn name(&self) -> &str {
         &self.name
     }
-    pub fn r#type(&self) -> &ExternType {
-        &self.r#type
+
+    /// Returns the expected type of this import.
+    pub fn ty(&self) -> &ExternType {
+        &self.ty
     }
 }
 
 // Export Types
 
+/// A descriptor for an exported WebAssembly value.
+///
+/// This type is primarily accessed from the
+/// [`Module::exports`](crate::Module::exports) accessor and describes what
+/// names are exported from a wasm module and the type of the item that is
+/// exported.
 #[derive(Debug, Clone)]
 pub struct ExportType {
-    name: Name,
-    r#type: ExternType,
+    name: String,
+    ty: ExternType,
 }
 
 impl ExportType {
-    pub fn new(name: Name, r#type: ExternType) -> ExportType {
-        ExportType { name, r#type }
+    /// Creates a new export which is exported with the given `name` and has the
+    /// given `ty`.
+    pub fn new(name: &str, ty: ExternType) -> ExportType {
+        ExportType {
+            name: name.to_string(),
+            ty,
+        }
     }
-    pub fn name(&self) -> &Name {
+
+    /// Returns the name by which this export is known by.
+    pub fn name(&self) -> &str {
         &self.name
     }
-    pub fn r#type(&self) -> &ExternType {
-        &self.r#type
+
+    /// Returns the type of this export.
+    pub fn ty(&self) -> &ExternType {
+        &self.ty
     }
 }

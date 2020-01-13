@@ -34,7 +34,7 @@ fn generate_struct(item: &syn::ItemTrait) -> syn::Result<TokenStream> {
     let root = root();
     Ok(quote! {
         #vis struct #name {
-            instance: #root::wasmtime_api::HostRef<#root::wasmtime_api::Instance>,
+            instance: #root::wasmtime::Instance,
             data: #root::wasmtime_interface_types::ModuleData,
         }
     })
@@ -48,51 +48,34 @@ fn generate_load(item: &syn::ItemTrait) -> syn::Result<TokenStream> {
         #vis fn load_file(path: impl AsRef<std::path::Path>) -> #root::anyhow::Result<#name> {
             let bytes = std::fs::read(path)?;
 
-            use #root::wasmtime_api::{HostRef, Config, Extern, Engine, Store, Instance, Module};
+            use #root::wasmtime::{Config, Extern, Engine, Store, Instance, Module};
             use #root::anyhow::{bail, format_err};
 
-            let config = {
-                let flag_builder = #root::cranelift_codegen::settings::builder();
-                let flags = #root::cranelift_codegen::settings::Flags::new(flag_builder);
-                let features = #root::wasmtime_jit::Features {
-                    multi_value: true,
-                    ..Default::default()
-                };
-                let strategy = #root::wasmtime_jit::CompilationStrategy::Auto;
-                Config::new(flags, features, false, strategy)
-            };
-            let engine = HostRef::new(Engine::new(config));
-            let store = HostRef::new(Store::new(&engine));
-            let global_exports = store.borrow().global_exports().clone();
+            let engine = Engine::new(Config::new().wasm_multi_value(true));
+            let store = Store::new(&engine);
+            let global_exports = store.global_exports().clone();
 
             let data = #root::wasmtime_interface_types::ModuleData::new(&bytes)?;
 
-            let module = HostRef::new(Module::new(&store, &bytes)?);
+            let module = Module::new(&store, &bytes)?;
 
             let mut imports: Vec<Extern> = Vec::new();
             if let Some(module_name) = data.find_wasi_module_name() {
-                let wasi_handle = wasmtime_wasi::instantiate_wasi(
-                    "",
-                    global_exports,
-                    &[],
-                    &[],
-                    &[],
-                )?;
-                let wasi_instance = Instance::from_handle(&store, wasi_handle)?;
-                for i in module.borrow().imports().iter() {
-                    if i.module().as_str() != module_name {
-                        bail!("unknown import module {}", i.module().as_str());
+                let wasi_instance = #root::wasmtime_wasi::create_wasi_instance(&store, &[], &[], &[])
+                    .map_err(|e| format_err!("wasm instantiation error: {:?}", e))?;
+                for i in module.imports().iter() {
+                    if i.module() != module_name {
+                        bail!("unknown import module {}", i.module());
                     }
-                    if let Some(export) = wasi_instance.find_export_by_name(i.name().as_str()) {
+                    if let Some(export) = wasi_instance.find_export_by_name(i.name()) {
                         imports.push(export.clone());
                     } else {
-                        bail!("unknown import {}:{}", i.module().as_str(), i.name().as_str())
+                        bail!("unknown import {}:{}", i.module(), i.name())
                     }
                 }
             }
-            let instance = HostRef::new(
-                Instance::new(&store, &module, &imports).map_err(|t| format_err!("instantiation trap: {:?}", t))?
-            );
+            let instance =
+                Instance::new(&store, &module, &imports).map_err(|t| format_err!("instantiation trap: {:?}", t))?;
 
             Ok(#name { instance, data })
         }
@@ -107,6 +90,7 @@ fn generate_methods(item: &syn::ItemTrait) -> syn::Result<TokenStream> {
     }
     let mut result = TokenStream::new();
     let root = root();
+    let vis = &item.vis;
 
     for item in item.items.iter() {
         let method = match item {
@@ -121,6 +105,14 @@ fn generate_methods(item: &syn::ItemTrait) -> syn::Result<TokenStream> {
         }
         if let Some(t) = &method.sig.asyncness {
             bail!(t, "cannot be `async`");
+        }
+        match &method.sig.inputs.first() {
+            Some(syn::FnArg::Receiver(_)) => {}
+            Some(t) => bail!(t, "first arugment needs to be \"self\""),
+            None => bail!(
+                method.sig,
+                "trait method requires at least one argument which needs to be \"self\""
+            ),
         }
 
         let mut args = Vec::new();
@@ -170,7 +162,7 @@ fn generate_methods(item: &syn::ItemTrait) -> syn::Result<TokenStream> {
 
         result.extend(quote! {
             #(#attrs)*
-            #sig {
+            #vis #sig {
                 let args = [
                     #(#args),*
                 ];

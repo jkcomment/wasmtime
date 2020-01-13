@@ -1,14 +1,15 @@
 //! Linking for JIT-compiled code.
 
 use crate::resolver::Resolver;
-use crate::HashSet;
-use alloc::vec::Vec;
-use core::ptr::write_unaligned;
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::ir::JumpTableOffsets;
-use cranelift_entity::PrimaryMap;
-use cranelift_wasm::{DefinedFuncIndex, Global, GlobalInit, Memory, Table, TableElementType};
 use more_asserts::assert_ge;
+use std::collections::HashSet;
+use std::ptr::write_unaligned;
+use wasmtime_environ::entity::PrimaryMap;
+use wasmtime_environ::wasm::{
+    DefinedFuncIndex, Global, GlobalInit, Memory, Table, TableElementType,
+};
 use wasmtime_environ::{
     MemoryPlan, MemoryStyle, Module, Relocation, RelocationTarget, Relocations, TablePlan,
 };
@@ -29,8 +30,8 @@ pub fn link_module(
     let mut dependencies = HashSet::new();
 
     let mut function_imports = PrimaryMap::with_capacity(module.imported_funcs.len());
-    for (index, (ref module_name, ref field)) in module.imported_funcs.iter() {
-        match resolver.resolve(module_name, field) {
+    for (index, (module_name, field, import_idx)) in module.imported_funcs.iter() {
+        match resolver.resolve(*import_idx, module_name, field) {
             Some(export_value) => match export_value {
                 Export::Function {
                     address,
@@ -70,8 +71,8 @@ pub fn link_module(
     }
 
     let mut table_imports = PrimaryMap::with_capacity(module.imported_tables.len());
-    for (index, (ref module_name, ref field)) in module.imported_tables.iter() {
-        match resolver.resolve(module_name, field) {
+    for (index, (module_name, field, import_idx)) in module.imported_tables.iter() {
+        match resolver.resolve(*import_idx, module_name, field) {
             Some(export_value) => match export_value {
                 Export::Table {
                     definition,
@@ -109,8 +110,8 @@ pub fn link_module(
     }
 
     let mut memory_imports = PrimaryMap::with_capacity(module.imported_memories.len());
-    for (index, (ref module_name, ref field)) in module.imported_memories.iter() {
-        match resolver.resolve(module_name, field) {
+    for (index, (module_name, field, import_idx)) in module.imported_memories.iter() {
+        match resolver.resolve(*import_idx, module_name, field) {
             Some(export_value) => match export_value {
                 Export::Memory {
                     definition,
@@ -128,16 +129,14 @@ pub fn link_module(
 
                     // Sanity-check: Ensure that the imported memory has at least
                     // guard-page protections the importing module expects it to have.
-                    match (memory.style, &import_memory.style) {
-                        (
-                            MemoryStyle::Static { bound },
-                            MemoryStyle::Static {
-                                bound: import_bound,
-                            },
-                        ) => {
-                            assert_ge!(bound, *import_bound);
-                        }
-                        _ => (),
+                    if let (
+                        MemoryStyle::Static { bound },
+                        MemoryStyle::Static {
+                            bound: import_bound,
+                        },
+                    ) = (memory.style, &import_memory.style)
+                    {
+                        assert_ge!(bound, *import_bound);
                     }
                     assert_ge!(memory.offset_guard_size, import_memory.offset_guard_size);
 
@@ -164,8 +163,8 @@ pub fn link_module(
     }
 
     let mut global_imports = PrimaryMap::with_capacity(module.imported_globals.len());
-    for (index, (ref module_name, ref field)) in module.imported_globals.iter() {
-        match resolver.resolve(module_name, field) {
+    for (index, (module_name, field, import_idx)) in module.imported_globals.iter() {
+        match resolver.resolve(*import_idx, module_name, field) {
             Some(export_value) => match export_value {
                 Export::Table { .. } | Export::Memory { .. } | Export::Function { .. } => {
                     return Err(LinkError(format!(

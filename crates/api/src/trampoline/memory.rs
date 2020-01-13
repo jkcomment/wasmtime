@@ -1,10 +1,8 @@
 use super::create_handle::create_handle;
 use crate::MemoryType;
-use alloc::boxed::Box;
-use alloc::string::ToString;
 use anyhow::Result;
-use cranelift_entity::PrimaryMap;
-use wasmtime_environ::Module;
+use wasmtime_environ::entity::PrimaryMap;
+use wasmtime_environ::{wasm, Module};
 use wasmtime_runtime::InstanceHandle;
 
 #[allow(dead_code)]
@@ -12,13 +10,9 @@ use wasmtime_runtime::InstanceHandle;
 pub fn create_handle_with_memory(memory: &MemoryType) -> Result<InstanceHandle> {
     let mut module = Module::new();
 
-    let memory = cranelift_wasm::Memory {
+    let memory = wasm::Memory {
         minimum: memory.limits().min(),
-        maximum: if memory.limits().max() == core::u32::MAX {
-            None
-        } else {
-            Some(memory.limits().max())
-        },
+        maximum: memory.limits().max(),
         shared: false, // TODO
     };
     let tunable = Default::default();

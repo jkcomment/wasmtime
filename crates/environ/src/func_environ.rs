@@ -1,9 +1,6 @@
 use crate::module::{MemoryPlan, MemoryStyle, Module, TableStyle};
 use crate::vmoffsets::VMOffsets;
 use crate::WASM_PAGE_SIZE;
-use alloc::vec::Vec;
-use core::clone::Clone;
-use core::convert::TryFrom;
 use cranelift_codegen::cursor::FuncCursor;
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::condcodes::*;
@@ -14,10 +11,11 @@ use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_entity::EntityRef;
 use cranelift_wasm::{
     self, FuncIndex, GlobalIndex, GlobalVariable, MemoryIndex, SignatureIndex, TableIndex,
-    WasmResult,
+    TargetEnvironment, WasmError, WasmResult,
 };
 #[cfg(feature = "lightbeam")]
 use cranelift_wasm::{DefinedFuncIndex, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex};
+use std::convert::TryFrom;
 
 /// Compute an `ir::ExternalName` for a given wasm function index.
 pub fn get_func_name(func_index: FuncIndex) -> ir::ExternalName {
@@ -357,9 +355,15 @@ impl lightbeam::ModuleContext for FuncEnvironment<'_> {
     // TODO: type of a global
 }
 
-impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'module_environment> {
+impl<'module_environment> TargetEnvironment for FuncEnvironment<'module_environment> {
     fn target_config(&self) -> TargetFrontendConfig {
         self.target_config
+    }
+}
+
+impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'module_environment> {
+    fn is_wasm_parameter(&self, func: &ir::Function, index: usize) -> bool {
+        func.signature.params[index].purpose == ir::ArgumentPurpose::Normal
     }
 
     fn make_table(&mut self, func: &mut ir::Function, index: TableIndex) -> WasmResult<ir::Table> {
@@ -452,9 +456,9 @@ impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'m
         // allocated up front and never moved.
         let (offset_guard_size, heap_style, readonly_base) = match self.module.memory_plans[index] {
             MemoryPlan {
-                memory: _,
                 style: MemoryStyle::Dynamic,
                 offset_guard_size,
+                memory: _,
             } => {
                 let heap_bound = func.create_global_value(ir::GlobalValueData::Load {
                     base: ptr,
@@ -471,9 +475,9 @@ impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'m
                 )
             }
             MemoryPlan {
-                memory: _,
                 style: MemoryStyle::Static { bound },
                 offset_guard_size,
+                memory: _,
             } => (
                 Uimm64::new(offset_guard_size),
                 ir::HeapStyle::Static {
@@ -703,5 +707,86 @@ impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'m
             .ins()
             .call_indirect(func_sig, func_addr, &[vmctx, memory_index]);
         Ok(*pos.func.dfg.inst_results(call_inst).first().unwrap())
+    }
+
+    fn translate_memory_copy(
+        &mut self,
+        _pos: FuncCursor,
+        _index: MemoryIndex,
+        _heap: ir::Heap,
+        _dst: ir::Value,
+        _src: ir::Value,
+        _len: ir::Value,
+    ) -> WasmResult<()> {
+        Err(WasmError::Unsupported("bulk memory".to_string()))
+    }
+
+    fn translate_memory_fill(
+        &mut self,
+        _pos: FuncCursor,
+        _index: MemoryIndex,
+        _heap: ir::Heap,
+        _dst: ir::Value,
+        _val: ir::Value,
+        _len: ir::Value,
+    ) -> WasmResult<()> {
+        Err(WasmError::Unsupported("bulk memory".to_string()))
+    }
+
+    fn translate_memory_init(
+        &mut self,
+        _pos: FuncCursor,
+        _index: MemoryIndex,
+        _heap: ir::Heap,
+        _seg_index: u32,
+        _dst: ir::Value,
+        _src: ir::Value,
+        _len: ir::Value,
+    ) -> WasmResult<()> {
+        Err(WasmError::Unsupported("bulk memory".to_string()))
+    }
+
+    fn translate_data_drop(&mut self, _pos: FuncCursor, _seg_index: u32) -> WasmResult<()> {
+        Err(WasmError::Unsupported("bulk memory".to_string()))
+    }
+
+    fn translate_table_size(
+        &mut self,
+        _pos: FuncCursor,
+        _index: TableIndex,
+        _table: ir::Table,
+    ) -> WasmResult<ir::Value> {
+        Err(WasmError::Unsupported("bulk memory".to_string()))
+    }
+
+    fn translate_table_copy(
+        &mut self,
+        _pos: FuncCursor,
+        _dst_table_index: TableIndex,
+        _dst_table: ir::Table,
+        _src_table_index: TableIndex,
+        _src_table: ir::Table,
+        _dst: ir::Value,
+        _src: ir::Value,
+        _len: ir::Value,
+    ) -> WasmResult<()> {
+        Err(WasmError::Unsupported("bulk memory".to_string()))
+    }
+
+    fn translate_table_init(
+        &mut self,
+        _pos: FuncCursor,
+        _seg_index: u32,
+        _table_index: TableIndex,
+        _table: ir::Table,
+        _dst: ir::Value,
+        _src: ir::Value,
+        _len: ir::Value,
+    ) -> WasmResult<()> {
+        Err(WasmError::Unsupported("bulk memory".to_string()))
+    }
+
+    fn translate_elem_drop(&mut self, _pos: FuncCursor, _seg_index: u32) -> WasmResult<()> {
+        Err(WasmError::Unsupported("bulk memory".to_string()))
     }
 }

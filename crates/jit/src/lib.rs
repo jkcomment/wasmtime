@@ -2,7 +2,6 @@
 
 #![deny(missing_docs, trivial_numeric_casts, unused_extern_crates)]
 #![warn(unused_import_braces)]
-#![cfg_attr(feature = "std", deny(unstable_features))]
 #![cfg_attr(feature = "clippy", plugin(clippy(conf_file = "../../clippy.toml")))]
 #![cfg_attr(
     feature = "cargo-clippy",
@@ -22,13 +21,6 @@
     )
 )]
 
-extern crate alloc;
-
-#[cfg(not(feature = "std"))]
-use hashbrown::{hash_map, HashMap, HashSet};
-#[cfg(feature = "std")]
-use std::collections::{hash_map, HashMap, HashSet};
-
 mod action;
 mod code_memory;
 mod compiler;
@@ -40,7 +32,10 @@ mod namespace;
 mod resolver;
 mod target_tunables;
 
-pub use crate::action::{ActionError, ActionOutcome, RuntimeValue};
+pub mod native;
+pub mod trampoline;
+
+pub use crate::action::{invoke, ActionError, ActionOutcome, RuntimeValue};
 pub use crate::code_memory::CodeMemory;
 pub use crate::compiler::{CompilationStrategy, Compiler};
 pub use crate::context::{Context, ContextError, Features, UnknownInstance};

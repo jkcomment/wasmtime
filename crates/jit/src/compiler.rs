@@ -1,21 +1,20 @@
 //! JIT compilation.
 
-use super::HashMap;
 use crate::code_memory::CodeMemory;
 use crate::instantiate::SetupError;
 use crate::target_tunables::target_tunables;
-use alloc::boxed::Box;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::convert::TryFrom;
 use cranelift_codegen::ir::InstBuilder;
-use cranelift_codegen::isa::{TargetFrontendConfig, TargetIsa};
+use cranelift_codegen::print_errors::pretty_error;
 use cranelift_codegen::Context;
 use cranelift_codegen::{binemit, ir};
-use cranelift_entity::{EntityRef, PrimaryMap};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_wasm::{DefinedFuncIndex, DefinedMemoryIndex, ModuleTranslationState};
+use cranelift_wasm::ModuleTranslationState;
+use std::collections::HashMap;
+use std::convert::TryFrom;
 use wasmtime_debug::{emit_debugsections_image, DebugInfoData};
+use wasmtime_environ::entity::{EntityRef, PrimaryMap};
+use wasmtime_environ::isa::{TargetFrontendConfig, TargetIsa};
+use wasmtime_environ::wasm::{DefinedFuncIndex, DefinedMemoryIndex};
 use wasmtime_environ::{
     Compilation, CompileError, CompiledFunction, Compiler as _C, FunctionBodyData, Module,
     ModuleVmctxInfo, Relocations, Traps, Tunables, VMOffsets,
@@ -158,33 +157,36 @@ impl Compiler {
 
         let dbg = if let Some(debug_data) = debug_data {
             let target_config = self.isa.frontend_config();
-            let triple = self.isa.triple().clone();
-            let mut funcs = Vec::new();
-            for (i, allocated) in allocated_functions.into_iter() {
-                let ptr = (*allocated) as *const u8;
-                let body_len = compilation.get(i).body.len();
-                funcs.push((ptr, body_len));
-            }
-            let module_vmctx_info = {
-                let ofs = VMOffsets::new(target_config.pointer_bytes(), &module);
-                let memory_offset =
-                    ofs.vmctx_vmmemory_definition_base(DefinedMemoryIndex::new(0)) as i64;
-                ModuleVmctxInfo {
-                    memory_offset,
-                    stack_slots,
+            let ofs = VMOffsets::new(target_config.pointer_bytes(), &module);
+            if ofs.num_defined_memories > 0 {
+                let mut funcs = Vec::new();
+                for (i, allocated) in allocated_functions.into_iter() {
+                    let ptr = (*allocated) as *const u8;
+                    let body_len = compilation.get(i).body.len();
+                    funcs.push((ptr, body_len));
                 }
-            };
-            let bytes = emit_debugsections_image(
-                triple,
-                &target_config,
-                &debug_data,
-                &module_vmctx_info,
-                &address_transform,
-                &value_ranges,
-                &funcs,
-            )
-            .map_err(|e| SetupError::DebugInfo(e))?;
-            Some(bytes)
+                let module_vmctx_info = {
+                    let memory_offset =
+                        ofs.vmctx_vmmemory_definition_base(DefinedMemoryIndex::new(0)) as i64;
+                    ModuleVmctxInfo {
+                        memory_offset,
+                        stack_slots,
+                    }
+                };
+                let bytes = emit_debugsections_image(
+                    self.isa.triple().clone(),
+                    target_config,
+                    &debug_data,
+                    &module_vmctx_info,
+                    &address_transform,
+                    &value_ranges,
+                    &funcs,
+                )
+                .map_err(SetupError::DebugInfo)?;
+                Some(bytes)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -201,7 +203,7 @@ impl Compiler {
         signature: &ir::Signature,
         value_size: usize,
     ) -> Result<*const VMFunctionBody, SetupError> {
-        use super::hash_map::Entry::{Occupied, Vacant};
+        use std::collections::hash_map::Entry::{Occupied, Vacant};
         Ok(match self.trampoline_park.entry(callee_address) {
             Occupied(entry) => *entry.get(),
             Vacant(entry) => {
@@ -336,7 +338,13 @@ fn make_trampoline(
             &mut trap_sink,
             &mut stackmap_sink,
         )
-        .map_err(|error| SetupError::Compile(CompileError::Codegen(error)))?;
+        .map_err(|error| {
+            SetupError::Compile(CompileError::Codegen(pretty_error(
+                &context.func,
+                Some(isa),
+                error,
+            )))
+        })?;
 
     context.emit_unwind_info(isa, &mut unwind_info);
 

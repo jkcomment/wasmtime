@@ -2,12 +2,10 @@
 
 use crate::compiler::Compiler;
 use crate::instantiate::SetupError;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::cmp::max;
-use core::{fmt, mem, ptr, slice};
-use cranelift_codegen::ir;
+use std::cmp::max;
+use std::{fmt, mem, ptr, slice};
 use thiserror::Error;
+use wasmtime_environ::ir;
 use wasmtime_runtime::{wasmtime_call_trampoline, Export, InstanceHandle, VMInvokeArgument};
 
 /// A runtime value.
@@ -164,7 +162,7 @@ pub fn invoke(
 
     // TODO: Support values larger than v128. And pack the values into memory
     // instead of just using fixed-sized slots.
-    // Subtract one becase we don't pass the vmctx argument in `values_vec`.
+    // Subtract one because we don't pass the vmctx argument in `values_vec`.
     let value_size = mem::size_of::<VMInvokeArgument>();
     let mut values_vec: Vec<VMInvokeArgument> =
         vec![VMInvokeArgument::new(); max(signature.params.len() - 1, signature.returns.len())];
@@ -194,11 +192,13 @@ pub fn invoke(
 
     // Call the trampoline.
     if let Err(message) = unsafe {
-        wasmtime_call_trampoline(
-            callee_vmctx,
-            exec_code_buf,
-            values_vec.as_mut_ptr() as *mut u8,
-        )
+        instance.with_signals_on(|| {
+            wasmtime_call_trampoline(
+                callee_vmctx,
+                exec_code_buf,
+                values_vec.as_mut_ptr() as *mut u8,
+            )
+        })
     } {
         return Ok(ActionOutcome::Trapped { message });
     }
